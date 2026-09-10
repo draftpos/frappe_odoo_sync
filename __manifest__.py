@@ -5,16 +5,18 @@
     'category': 'Technical',
     'summary': 'Full bidirectional sync between Havano POS Desk and Frappe/ERPNext',
     'description': """
-Adds a "Frappe / ERPNext" integration tab to every Tenant in Havano POS Desk.
-When enabled, syncs the following entities bidirectionally using only Python stdlib (no pip packages):
-  - Products  (Frappe Items -> Odoo havanoposdesk.product)
-  - Pricelists (Frappe Price Lists -> Odoo havanoposdesk.pricelist / product.uom.price)
-  - Customers  (Frappe Customers -> Odoo havanoposdesk.customer)
-  - Inventory  (Frappe Stock -> Odoo havanoposdesk.store)
-  - Sales      (Frappe Sales Invoice -> Odoo havanoposdesk.terminal.session.order)
-  - Users      (Frappe Users -> Odoo havanoposdesk.saas.users)
-  - Stores     (Frappe Warehouse -> Odoo havanoposdesk.store)
-  - Payments   (Frappe Payment Entry -> Odoo havanoposdesk.terminal.session.order.line)
+Frappe / ERPNext Sync Bridge for Havano POS Desk.
+
+Bidirectional sync using only Python stdlib (no pip packages):
+
+- Products (Frappe Items <-> Odoo havanoposdesk.product)
+- UOMs (Frappe UOM <-> Odoo havanoposdesk.uom)
+- Customers (Frappe Customers <-> Odoo havanoposdesk.customer)
+- Stores (Frappe Warehouse <-> Odoo havanoposdesk.store)
+- Sales (Odoo sales -> Frappe Sales Invoice)
+
+Variance sync: updates existing records on both ends when prices, UOM or name change.
+Auto-syncs every minute via scheduled action.
     """,
     'depends': ['havanoposdesk_odoo', 'base'],
     'data': [
