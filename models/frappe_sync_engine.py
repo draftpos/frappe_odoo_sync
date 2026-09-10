@@ -55,7 +55,10 @@ class FrappeSyncEngine(models.TransientModel):
             # 3. Pull Frappe Users → Odoo
             u_pull_res = self._pull_users_from_frappe(tenant)
 
-            # 4. Push Odoo data → Frappe
+            # 4. Pull Frappe Warehouses → Odoo Stores
+            st_pull_res = self._pull_stores_from_frappe(tenant)
+
+            # 5. Push Odoo data → Frappe
             p_res = self._sync_products(tenant)
             c_res = self._sync_customers(tenant)
             s_res = self._sync_stores(tenant)
@@ -64,6 +67,7 @@ class FrappeSyncEngine(models.TransientModel):
 
             pull_s, pull_sk = pull_res['synced'], pull_res['skipped']
             u_pull_s, u_pull_sk = u_pull_res['synced'], u_pull_res['skipped']
+            st_pull_s, st_pull_sk = st_pull_res['synced'], st_pull_res['skipped']
             
             p_s, p_sk = p_res['synced'], p_res['skipped']
             c_s, c_sk = c_res['synced'], c_res['skipped']
@@ -72,7 +76,7 @@ class FrappeSyncEngine(models.TransientModel):
             u_push_s, u_push_sk = u_push_res['synced'], u_push_res['skipped']
 
             msg = (
-                f'Pulled from Frappe: {pull_s} Products (skipped: {pull_sk}), {u_pull_s} Users (skipped: {u_pull_sk}).\n'
+                f'Pulled from Frappe: {pull_s} Products (skipped: {pull_sk}), {u_pull_s} Users (skipped: {u_pull_sk}), {st_pull_s} Stores (skipped: {st_pull_sk}).\n'
                 f'Pushed to Frappe: {p_s} Products, {c_s} Customers, {s_s} Stores, {sa_s} Sales, {u_push_s} Users.\n'
                 f'Skipped (already in Frappe): {p_sk} Products, {c_sk} Customers, {s_sk} Stores, {sa_sk} Sales, {u_push_sk} Users.'
             )
@@ -602,6 +606,62 @@ class FrappeSyncEngine(models.TransientModel):
         if count > 0:
             self._log(tenant, 'Customer', 'success', f'Pushed {count} customers to Frappe', count)
         return {'synced': count, 'skipped': skipped}
+
+    def _pull_stores_from_frappe(self, tenant):
+        """Pull Frappe Warehouses -> Odoo Stores (havanoposdesk.store)"""
+        frappe_warehouses = self._frappe_get(tenant, 'Warehouse', limit=500)
+        if not frappe_warehouses:
+            return {'synced': 0, 'skipped': 0}
+
+        odoo_stores = self.env['havanoposdesk.store'].sudo().search([('tenant_id', '=', tenant.id)])
+        name_to_store = {s.name.lower(): s for s in odoo_stores if s.name}
+
+        created = 0
+        updated = 0
+        skipped = 0
+        errors = 0
+
+        for f_wh in frappe_warehouses:
+            wh_name = f_wh.get('warehouse_name') or f_wh.get('name')
+            if not wh_name or wh_name == 'All Warehouses':
+                continue
+                
+            is_active = not bool(f_wh.get('disabled', 0))
+
+            odoo_store = name_to_store.get(wh_name.lower())
+            if odoo_store:
+                if odoo_store.active != is_active:
+                    try:
+                        with self.env.cr.savepoint():
+                            odoo_store.sudo().write({'active': is_active})
+                        updated += 1
+                    except Exception as e:
+                        errors += 1
+                        self._log(tenant, 'Store (pull)', 'error', f'Failed to update "{wh_name}": {str(e)}')
+                else:
+                    skipped += 1
+                continue
+
+            # Create new store in Odoo
+            try:
+                vals = {
+                    'name': wh_name,
+                    'tenant_id': tenant.id,
+                    'active': is_active,
+                }
+                with self.env.cr.savepoint():
+                    new_store = self.env['havanoposdesk.store'].sudo().create(vals)
+                name_to_store[wh_name.lower()] = new_store
+                created += 1
+            except Exception as e:
+                errors += 1
+                self._log(tenant, 'Store (pull)', 'error', f'Failed to create "{wh_name}": {str(e)}')
+
+        total = created + updated
+        if total > 0 or errors > 0:
+            self._log(tenant, 'Store (pull)', 'success' if total > 0 else 'error', 
+                      f'Frappe → Odoo: {created} created, {updated} updated, {skipped} existing, {errors} errors', total)
+        return {'synced': total, 'skipped': skipped}
 
     def _sync_stores(self, tenant):
         """Push Odoo stores TO Frappe as Warehouses."""
