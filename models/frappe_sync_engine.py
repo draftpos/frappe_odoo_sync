@@ -1,4 +1,4 @@
-﻿import json
+import json
 import time
 import urllib.request
 import urllib.parse
@@ -46,6 +46,9 @@ class FrappeSyncEngine(models.TransientModel):
     def sync_tenant(self, tenant):
         start_time = time.time()
         try:
+            # Sync UOMs first so Frappe has them before products/sales reference them
+            self._sync_uoms(tenant)
+
             p_res = self._sync_products(tenant)
             c_res = self._sync_customers(tenant)
             s_res = self._sync_stores(tenant)
@@ -159,21 +162,59 @@ class FrappeSyncEngine(models.TransientModel):
                 return t.get('name')
         return territories[0].get('name') if territories else 'All Territories'
 
-    def _get_frappe_uom(self, tenant):
-        uoms = self._frappe_get(tenant, 'UOM', limit=20)
-        for u in uoms:
-            if u.get('name', '').lower() in ['nos', 'each', 'unit', 'piece', 'pcs']:
-                return u.get('name')
+    def _get_frappe_uom(self, tenant, preferred_name=None):
+        """Return the best matching UOM name from Frappe.
+
+        If *preferred_name* is given, look for an exact (case-insensitive)
+        match first so we honour the product's actual UOM.  Fall back to
+        'Nos' / 'Each' / first available UOM if nothing matches.
+        """
+        uoms = self._frappe_get(tenant, 'UOM', limit=100)
+        uom_map = {u.get('name', '').lower(): u.get('name') for u in uoms}
+
+        if preferred_name:
+            # Exact match (case-insensitive)
+            match = uom_map.get(preferred_name.lower())
+            if match:
+                return match
+
+        # Generic fallbacks
+        for fallback in ['nos', 'each', 'unit', 'piece', 'pcs']:
+            if fallback in uom_map:
+                return uom_map[fallback]
+
         return uoms[0].get('name') if uoms else 'Nos'
+
+    def _sync_uoms(self, tenant):
+        """Push Odoo UOMs to Frappe's UOM doctype so items can reference them."""
+        frappe_uoms = self._frappe_get(tenant, 'UOM', limit=100)
+        frappe_uom_names = {u.get('name', '').lower(): u.get('name') for u in frappe_uoms}
+
+        odoo_uoms = self.env['havanoposdesk.uom'].search([('tenant_id', '=', tenant.id)])
+        pushed = 0
+        for uom in odoo_uoms:
+            if uom.name.lower() in frappe_uom_names:
+                continue  # Already exists
+            res = self._frappe_post(tenant, 'UOM', {'uom_name': uom.name})
+            if res and res.get('name'):
+                pushed += 1
+        if pushed:
+            self._log(tenant, 'UOM', 'success', f'Pushed {pushed} UOMs to Frappe', pushed)
 
     def _sync_products(self, tenant):
         """Push Odoo products TO Frappe as Items."""
-        # Get existing Frappe items by item_code
-        frappe_items = self._frappe_get(tenant, 'Item', limit=1000)
-        frappe_item_codes = {i.get('item_code', i.get('name', '')): True for i in frappe_items}
+        # Fetch existing Frappe items - match on both item_code and name
+        frappe_items = self._frappe_get(tenant, 'Item', limit=2000)
+        frappe_item_codes = set()
+        for i in frappe_items:
+            if i.get('item_code'):
+                frappe_item_codes.add(i['item_code'])
+            if i.get('name'):
+                frappe_item_codes.add(i['name'])
 
         item_group = self._get_frappe_item_group(tenant)
-        stock_uom = self._get_frappe_uom(tenant)
+        # Cache fallback UOM once
+        fallback_uom = self._get_frappe_uom(tenant)
 
         products = self.env['havanoposdesk.product'].search([
             ('tenant_id', '=', tenant.id),
@@ -190,6 +231,10 @@ class FrappeSyncEngine(models.TransientModel):
                 skipped += 1
                 continue
 
+            # Use the product's own UOM; fall back to a generic UOM if not mapped
+            product_uom_name = product.uom_id.name if product.uom_id else None
+            stock_uom = self._get_frappe_uom(tenant, preferred_name=product_uom_name) if product_uom_name else fallback_uom
+
             item_data = {
                 'item_code': code,
                 'item_name': product.name,
@@ -205,6 +250,8 @@ class FrappeSyncEngine(models.TransientModel):
                 count += 1
             else:
                 errors += 1
+                self._log(tenant, 'Item', 'error',
+                          f'Failed to push product "{product.name}" (code={code}, uom={stock_uom})')
 
         if count > 0:
             self._log(tenant, 'Item', 'success', f'Pushed {count} products to Frappe (errors: {errors})', count)
@@ -327,7 +374,7 @@ class FrappeSyncEngine(models.TransientModel):
         ], limit=50, order='id asc')
 
         item_group = self._get_frappe_item_group(tenant)
-        stock_uom = self._get_frappe_uom(tenant)
+        fallback_uom = self._get_frappe_uom(tenant)
 
         count = 0
         skipped = 0
@@ -349,16 +396,20 @@ class FrappeSyncEngine(models.TransientModel):
             # Build items list - ensure each item exists in Frappe first
             items = []
             for line in sale.line_ids:
-                code = line.product_id.item_code or line.product_id.name
-                name = line.product_id.name
+                product = line.product_id
+                code = product.item_code or product.name
+                name = product.name
+                # Resolve the line's UOM (product UOM or fallback)
+                line_uom_name = product.uom_id.name if product.uom_id else None
+                line_uom = self._get_frappe_uom(tenant, preferred_name=line_uom_name) if line_uom_name else fallback_uom
                 # Best-effort: create item in Frappe if missing
-                self._ensure_frappe_item_exists(tenant, code, name, item_group, stock_uom)
+                self._ensure_frappe_item_exists(tenant, code, name, item_group, line_uom)
                 items.append({
                     'item_code': code,
                     'item_name': name,
                     'qty': line.accepted_qty or 1.0,
                     'rate': line.rate or 0.0,
-                    'uom': stock_uom,
+                    'uom': line_uom,
                 })
 
             if not items:
