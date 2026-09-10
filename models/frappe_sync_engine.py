@@ -667,6 +667,10 @@ class FrappeSyncEngine(models.TransientModel):
         frappe_invoices = self._frappe_get(tenant, 'Sales Invoice', limit=2000)
         synced_sales = {inv.get('po_no'): True for inv in frappe_invoices if inv.get('po_no')}
 
+        # Fetch Frappe warehouses to map to Odoo stores
+        frappe_whs = self._frappe_get(tenant, 'Warehouse', limit=500)
+        wh_name_to_id = {w.get('warehouse_name', w.get('name', '')): w.get('name') for w in frappe_whs}
+
         sales = self.env['havanoposdesk.sale'].search([
             ('tenant_id', '=', tenant.id),
             ('state', 'in', ['done', 'confirmed'])
@@ -715,16 +719,20 @@ class FrappeSyncEngine(models.TransientModel):
                 continue
 
             customer_name = sale.customer.name if sale.customer else 'CASH'
+            store_name = sale.store or (sale.store_id.name if sale.store_id else '')
+            frappe_wh_id = wh_name_to_id.get(store_name)
 
             data = {
                 'customer': customer_name,
                 'po_no': sale.name,
                 'items': items,
-                'update_stock': 0,
+                'update_stock': 1,
                 'set_posting_time': 1,
                 'posting_date': str(sale.posting_date) if sale.posting_date else str(fields.Date.today()),
                 'docstatus': 1,
             }
+            if frappe_wh_id:
+                data['set_warehouse'] = frappe_wh_id
 
             res = self._frappe_post(tenant, 'Sales Invoice', data)
             if res and res.get('name'):
