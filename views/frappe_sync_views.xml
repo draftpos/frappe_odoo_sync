@@ -19,11 +19,15 @@
                     <button string="Sync Now" type="object" name="action_sync_now" class="oe_highlight btn-success" icon="fa-refresh"/>
                     
                     <field name="frappe_sync_log_ids" readonly="1" class="mt-4">
-                        <list string="Sync Logs" default_order="create_date desc" decoration-success="status == 'success'" decoration-danger="status == 'error'">
-                            <field name="create_date"/>
+                        <list string="Sync Logs" default_order="create_date desc" decoration-success="status == 'success'" decoration-danger="status == 'error'" decoration-info="status == 'skipped'">
+                            <field name="create_date" string="Created on"/>
                             <field name="entity"/>
-                            <field name="status" widget="badge" decoration-success="status == 'success'" decoration-danger="status == 'error'"/>
-                            <field name="records_synced"/>
+                            <field name="status" widget="badge"
+                                decoration-success="status == 'success'"
+                                decoration-danger="status == 'error'"
+                                decoration-info="status == 'skipped'"/>
+                            <field name="records_synced" string="Records ..."/>
+                            <field name="details" optional="hide"/>
                         </list>
                     </field>
                 </page>
@@ -41,12 +45,19 @@
         <field name="name">frappe.sync.log.tree</field>
         <field name="model">frappe.sync.log</field>
         <field name="arch" type="xml">
-            <list create="false" edit="false" default_order="create_date desc">
-                <field name="create_date"/>
+            <list create="false" edit="false" default_order="create_date desc"
+                  decoration-success="status == 'success'"
+                  decoration-danger="status == 'error'"
+                  decoration-info="status == 'skipped'">
+                <field name="create_date" string="Created on"/>
                 <field name="tenant_id"/>
                 <field name="entity"/>
-                <field name="status" widget="badge" decoration-success="status == 'success'" decoration-danger="status == 'error'"/>
-                <field name="records_synced"/>
+                <field name="status" widget="badge"
+                    decoration-success="status == 'success'"
+                    decoration-danger="status == 'error'"
+                    decoration-info="status == 'skipped'"/>
+                <field name="records_synced" string="Records"/>
+                <field name="details" optional="hide"/>
             </list>
         </field>
     </record>

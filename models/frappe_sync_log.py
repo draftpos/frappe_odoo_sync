@@ -8,6 +8,10 @@ class FrappeSyncLog(models.Model):
 
     tenant_id = fields.Many2one('havanoposdesk.tenant', string='Tenant', ondelete='cascade', required=True)
     entity = fields.Char('Entity')
-    status = fields.Selection([('success', 'Success'), ('error', 'Error')], string='Status')
+    status = fields.Selection([
+        ('success', 'Success'),
+        ('error', 'Error'),
+        ('skipped', 'Existing'),
+    ], string='Status')
     details = fields.Text('Details')
     records_synced = fields.Integer('Records Synced', default=0)
