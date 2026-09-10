@@ -51,23 +51,30 @@ class FrappeSyncEngine(models.TransientModel):
 
             # 2. Pull Frappe Items → Odoo (bidirectional product sync)
             pull_res = self._pull_products_from_frappe(tenant)
+            
+            # 3. Pull Frappe Users → Odoo
+            u_pull_res = self._pull_users_from_frappe(tenant)
 
-            # 3. Push Odoo products → Frappe
+            # 4. Push Odoo data → Frappe
             p_res = self._sync_products(tenant)
             c_res = self._sync_customers(tenant)
             s_res = self._sync_stores(tenant)
             sa_res = self._sync_sales(tenant)
+            u_push_res = self._sync_users(tenant)
 
             pull_s, pull_sk = pull_res['synced'], pull_res['skipped']
+            u_pull_s, u_pull_sk = u_pull_res['synced'], u_pull_res['skipped']
+            
             p_s, p_sk = p_res['synced'], p_res['skipped']
             c_s, c_sk = c_res['synced'], c_res['skipped']
             s_s, s_sk = s_res['synced'], s_res['skipped']
             sa_s, sa_sk = sa_res['synced'], sa_res['skipped']
+            u_push_s, u_push_sk = u_push_res['synced'], u_push_res['skipped']
 
             msg = (
-                f'Pulled from Frappe: {pull_s} Products (skipped: {pull_sk}).\n'
-                f'Pushed to Frappe: {p_s} Products, {c_s} Customers, {s_s} Stores, {sa_s} Sales.\n'
-                f'Skipped (already in Frappe): {p_sk} Products, {c_sk} Customers, {s_sk} Stores, {sa_sk} Sales.'
+                f'Pulled from Frappe: {pull_s} Products (skipped: {pull_sk}), {u_pull_s} Users (skipped: {u_pull_sk}).\n'
+                f'Pushed to Frappe: {p_s} Products, {c_s} Customers, {s_s} Stores, {sa_s} Sales, {u_push_s} Users.\n'
+                f'Skipped (already in Frappe): {p_sk} Products, {c_sk} Customers, {s_sk} Stores, {sa_sk} Sales, {u_push_sk} Users.'
             )
             self._log(tenant, 'All Entities', 'success', f'Sync completed in {round(time.time() - start_time, 2)}s\n{msg}')
 
@@ -730,3 +737,144 @@ class FrappeSyncEngine(models.TransientModel):
             self._log(tenant, 'Sales Invoice', 'success', f'Pushed {count} sales to Frappe', count)
         return {'synced': count, 'skipped': skipped}
 
+    def _pull_users_from_frappe(self, tenant):
+        """Pull Frappe Users -> Odoo res.users (tenant specific)"""
+        frappe_users = self._frappe_get(tenant, 'User', limit=1000)
+        if not frappe_users:
+            return {'synced': 0, 'skipped': 0}
+
+        odoo_users = self.env['res.users'].sudo().search([('tenant_id', '=', tenant.id)])
+        login_to_user = {u.login.lower(): u for u in odoo_users}
+
+        created = 0
+        updated = 0
+        skipped = 0
+        errors = 0
+
+        # Don't sync internal Frappe users
+        ignore_emails = ['Administrator', 'Guest']
+
+        for f_user in frappe_users:
+            email = (f_user.get('email') or f_user.get('name') or '').strip()
+            if not email or email in ignore_emails or '@' not in email:
+                continue
+
+            # In Frappe, full_name is often calculated from first_name + last_name
+            f_first = (f_user.get('first_name') or '').strip()
+            f_last = (f_user.get('last_name') or '').strip()
+            f_name = f_user.get('full_name') or f"{f_first} {f_last}".strip() or email
+            f_active = bool(f_user.get('enabled', 1))
+
+            odoo_user = login_to_user.get(email.lower())
+            
+            if odoo_user:
+                update_vals = {}
+                if odoo_user.name != f_name:
+                    update_vals['name'] = f_name
+                if odoo_user.active != f_active:
+                    update_vals['active'] = f_active
+
+                if update_vals:
+                    try:
+                        with self.env.cr.savepoint():
+                            odoo_user.sudo().write(update_vals)
+                        updated += 1
+                    except Exception as e:
+                        errors += 1
+                        self._log(tenant, 'User (pull)', 'error', f'Failed to update "{email}": {str(e)}')
+                else:
+                    skipped += 1
+                    self._log(tenant, f'User: {email}', 'skipped', f'User "{email}" already up to date in Odoo')
+                continue
+
+            # CREATE
+            try:
+                # Assign default values suitable for POS cashiers in Havano
+                vals = {
+                    'name': f_name,
+                    'login': email,
+                    'active': f_active,
+                    'tenant_id': tenant.id,
+                    'havano_role': 'cashier',
+                    'saas_state': 'verified', 
+                }
+                with self.env.cr.savepoint():
+                    new_user = self.env['res.users'].sudo().create(vals)
+                login_to_user[email.lower()] = new_user
+                created += 1
+            except Exception as e:
+                errors += 1
+                self._log(tenant, 'User (pull)', 'error', f'Failed to create "{email}": {str(e)}')
+
+        total = created + updated
+        if total > 0 or errors > 0:
+            self._log(tenant, 'User (pull)', 'success' if total > 0 else 'error', 
+                      f'Frappe → Odoo: {created} created, {updated} updated, {skipped} existing, {errors} errors', total)
+        return {'synced': total, 'skipped': skipped}
+
+    def _sync_users(self, tenant):
+        """Push Odoo res.users -> Frappe User"""
+        frappe_users_list = self._frappe_get(tenant, 'User', limit=1000)
+        frappe_user_map = {}
+        for u in frappe_users_list:
+            email = u.get('email') or u.get('name')
+            if email:
+                frappe_user_map[email.lower()] = u
+
+        odoo_users = self.env['res.users'].sudo().search([('tenant_id', '=', tenant.id)])
+
+        created = 0
+        updated = 0
+        skipped = 0
+        errors = 0
+
+        for user in odoo_users:
+            if not user.login or '@' not in user.login:
+                continue
+
+            email = user.login.lower()
+            name_parts = user.name.split(' ', 1)
+            first_name = name_parts[0]
+            last_name = name_parts[1] if len(name_parts) > 1 else ''
+
+            if email in frappe_user_map:
+                existing = frappe_user_map[email]
+                update_data = {}
+
+                # Variance checks
+                if (existing.get('first_name') or '') != first_name:
+                    update_data['first_name'] = first_name
+                if (existing.get('last_name') or '') != last_name:
+                    update_data['last_name'] = last_name
+                if bool(existing.get('enabled', 1)) != user.active:
+                    update_data['enabled'] = 1 if user.active else 0
+
+                if update_data:
+                    res = self._frappe_put(tenant, 'User', email, update_data)
+                    if res and res.get('name'):
+                        updated += 1
+                    else:
+                        errors += 1
+                else:
+                    skipped += 1
+                    self._log(tenant, f'User: {email}', 'skipped', f'User "{email}" already up to date in Frappe')
+            else:
+                user_data = {
+                    'email': email,
+                    'first_name': first_name,
+                    'last_name': last_name,
+                    'enabled': 1 if user.active else 0,
+                    'send_welcome_email': 0,
+                }
+                res = self._frappe_post(tenant, 'User', user_data)
+                if res and res.get('name'):
+                    created += 1
+                else:
+                    errors += 1
+                    self._log(tenant, 'User', 'error', f'Failed to push user "{email}"')
+
+        total = created + updated
+        if total > 0 or errors > 0:
+            self._log(tenant, 'User (push)', 'success' if total > 0 else 'error', 
+                      f'Odoo → Frappe: {created} created, {updated} updated, {skipped} existing, {errors} errors', total)
+        return {'synced': total, 'skipped': skipped}
