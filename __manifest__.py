@@ -21,10 +21,14 @@ Auto-syncs every minute via scheduled action.
     'depends': ['havanoposdesk_odoo', 'base'],
     'data': [
         'security/ir.model.access.csv',
-        'views/frappe_sync_assets.xml',
         'views/frappe_sync_views.xml',
         'data/frappe_sync_cron.xml',
     ],
+    'assets': {
+        'web.assets_backend': [
+            'frappe_odoo_sync/static/src/js/sync_log_autorefresh.js',
+        ],
+    },
     'images': ['static/description/icon.png'],
     'installable': True,
     'application': False,
