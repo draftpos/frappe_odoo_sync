@@ -512,7 +512,9 @@ class FrappeSyncEngine(models.TransientModel):
                 if (existing.get('item_name') or '') != product.name:
                     update_data['item_name'] = product.name
                 if (existing.get('stock_uom') or '').lower() != stock_uom.lower():
-                    update_data['stock_uom'] = stock_uom
+                    # Frappe strictly blocks changing Default UOM if stock transactions exist.
+                    # We log a warning but skip syncing this specific field so the rest of the sync doesn't crash.
+                    self._log(tenant, f'Item: {code}', 'error', f'UOM changed in Odoo to {stock_uom} but Frappe blocks UOM updates for items with transactions. You must create a new item to change the UOM.')
                 if bool(existing.get('is_stock_item', 1)) != product.track_qty:
                     update_data['is_stock_item'] = 1 if product.track_qty else 0
                 odoo_barcode = product.barcode or ''
