@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <odoo>
-    <template id="assets_backend" inherit_id="web.assets_backend">
-        <xpath expr="." position="inside">
-            <script type="module" src="/frappe_odoo_sync/static/src/js/sync_log_autorefresh.js"/>
-        </xpath>
-    </template>
+    <record id="frappe_sync_autorefresh_js" model="ir.asset">
+        <field name="name">Frappe Sync Log Auto-refresh</field>
+        <field name="bundle">web.assets_backend</field>
+        <field name="path">frappe_odoo_sync/static/src/js/sync_log_autorefresh.js</field>
+    </record>
 </odoo>
