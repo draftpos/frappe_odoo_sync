@@ -46,22 +46,31 @@ class FrappeSyncEngine(models.TransientModel):
     def sync_tenant(self, tenant):
         start_time = time.time()
         try:
-            # Sync UOMs first so Frappe has them before products/sales reference them
+            # 1. Sync UOMs first so Frappe has them before products/sales reference them
             self._sync_uoms(tenant)
 
+            # 2. Pull Frappe Items → Odoo (bidirectional product sync)
+            pull_res = self._pull_products_from_frappe(tenant)
+
+            # 3. Push Odoo products → Frappe
             p_res = self._sync_products(tenant)
             c_res = self._sync_customers(tenant)
             s_res = self._sync_stores(tenant)
             sa_res = self._sync_sales(tenant)
-            
+
+            pull_s, pull_sk = pull_res['synced'], pull_res['skipped']
             p_s, p_sk = p_res['synced'], p_res['skipped']
             c_s, c_sk = c_res['synced'], c_res['skipped']
             s_s, s_sk = s_res['synced'], s_res['skipped']
             sa_s, sa_sk = sa_res['synced'], sa_res['skipped']
-            
-            msg = f'Synced: {p_s} Products, {c_s} Customers, {s_s} Stores, {sa_s} Sales.\nSkipped (Already in Frappe): {p_sk} Products, {c_sk} Customers, {s_sk} Stores, {sa_sk} Sales.'
+
+            msg = (
+                f'Pulled from Frappe: {pull_s} Products (skipped: {pull_sk}).\n'
+                f'Pushed to Frappe: {p_s} Products, {c_s} Customers, {s_s} Stores, {sa_s} Sales.\n'
+                f'Skipped (already in Frappe): {p_sk} Products, {c_sk} Customers, {s_sk} Stores, {sa_sk} Sales.'
+            )
             self._log(tenant, 'All Entities', 'success', f'Sync completed in {round(time.time() - start_time, 2)}s\n{msg}')
-            
+
             return {
                 'type': 'ir.actions.client',
                 'tag': 'display_notification',
@@ -215,6 +224,92 @@ class FrappeSyncEngine(models.TransientModel):
             # res == {'exists': True} means it was already there — also fine
         if pushed:
             self._log(tenant, 'UOM', 'success', f'Pushed {pushed} UOMs to Frappe', pushed)
+
+    def _get_or_create_odoo_uom(self, tenant, uom_name):
+        """Find an existing havanoposdesk.uom by name (case-insensitive) or create it."""
+        if not uom_name:
+            uom_name = 'Each'
+        uom = self.env['havanoposdesk.uom'].sudo().search([
+            ('tenant_id', '=', tenant.id),
+            ('name', '=ilike', uom_name.strip())
+        ], limit=1)
+        if not uom:
+            uom = self.env['havanoposdesk.uom'].sudo().create({
+                'name': uom_name.strip(),
+                'tenant_id': tenant.id,
+            })
+        return uom
+
+    def _pull_products_from_frappe(self, tenant):
+        """Pull Frappe Items → Odoo as havanoposdesk.product records.
+
+        Only creates products that do not yet exist in Odoo (matched by
+        item_code).  Does not overwrite existing Odoo products.
+        """
+        frappe_items = self._frappe_get(tenant, 'Item', limit=2000)
+        if not frappe_items:
+            return {'synced': 0, 'skipped': 0}
+
+        # Build a fast lookup of existing Odoo products by item_code for this tenant
+        existing_products = self.env['havanoposdesk.product'].sudo().search([
+            ('tenant_id', '=', tenant.id)
+        ])
+        existing_codes = {p.item_code for p in existing_products if p.item_code}
+        existing_names = {p.name.lower() for p in existing_products}
+
+        # Find the tenant's default category
+        default_category = self.env['havanoposdesk.category'].sudo().search([
+            ('tenant_id', '=', tenant.id)
+        ], limit=1)
+
+        count = 0
+        skipped = 0
+        errors = 0
+        for item in frappe_items:
+            item_code = item.get('item_code') or item.get('name', '')
+            item_name = item.get('item_name') or item_code
+
+            # Skip if already in Odoo (by code or by name)
+            if item_code in existing_codes or item_name.lower() in existing_names:
+                skipped += 1
+                continue
+
+            # Resolve / create UOM
+            uom_name = item.get('stock_uom') or 'Each'
+            uom = self._get_or_create_odoo_uom(tenant, uom_name)
+
+            try:
+                vals = {
+                    'item_code': item_code,
+                    'name': item_name,
+                    'selling_price': float(item.get('standard_rate') or 0.0),
+                    'buying_price': float(item.get('valuation_rate') or 0.0),
+                    'track_qty': bool(item.get('is_stock_item', 1)),
+                    'is_active': True,
+                    'uom_id': uom.id,
+                    'tenant_id': tenant.id,
+                    'internal_notes': item.get('description') or '',
+                }
+                if default_category:
+                    vals['category_id'] = default_category.id
+
+                self.env['havanoposdesk.product'].sudo().create(vals)
+                # Track so duplicates within the same batch are also skipped
+                existing_codes.add(item_code)
+                existing_names.add(item_name.lower())
+                count += 1
+            except Exception as e:
+                errors += 1
+                self._log(tenant, 'Item (pull)', 'error',
+                          f'Failed to create product "{item_name}" from Frappe: {str(e)}')
+
+        if count > 0:
+            self._log(tenant, 'Item (pull)', 'success',
+                      f'Pulled {count} products from Frappe into Odoo (errors: {errors})', count)
+        elif errors > 0:
+            self._log(tenant, 'Item (pull)', 'error',
+                      f'Failed to pull some products from Frappe. Errors: {errors}')
+        return {'synced': count, 'skipped': skipped}
 
     def _sync_products(self, tenant):
         """Push Odoo products TO Frappe as Items."""
