@@ -403,7 +403,8 @@ class FrappeSyncEngine(models.TransientModel):
 
                 if update_vals:
                     try:
-                        odoo_product.sudo().write(update_vals)
+                        with self.env.cr.savepoint():
+                            odoo_product.sudo().write(update_vals)
                         updated += 1
                     except Exception as e:
                         errors += 1
@@ -437,7 +438,8 @@ class FrappeSyncEngine(models.TransientModel):
                 if default_store:
                     vals['store_ids'] = [(4, default_store.id)]
 
-                new_prod = self.env['havanoposdesk.product'].sudo().create(vals)
+                with self.env.cr.savepoint():
+                    new_prod = self.env['havanoposdesk.product'].sudo().create(vals)
                 code_to_product[item_code] = new_prod
                 name_to_product[item_name.lower()] = new_prod
                 created += 1
