@@ -131,6 +131,26 @@ class FrappeSyncEngine(models.TransientModel):
             self._log(tenant, doctype, 'error', f'Failed to post: {str(e)}')
             return None
 
+    def _frappe_put(self, tenant, doctype, doc_name, data):
+        """PUT (update) an existing document in Frappe."""
+        url = f"{tenant.frappe_url.rstrip('/')}/api/resource/{urllib.parse.quote(doctype)}/{urllib.parse.quote(str(doc_name))}"
+        payload = json.dumps(data).encode('utf-8')
+        req = urllib.request.Request(url, data=payload, method='PUT', headers={
+            'Authorization': f'token {tenant.frappe_api_key}:{tenant.frappe_api_secret}',
+            'Accept': 'application/json',
+            'Content-Type': 'application/json'
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=15) as response:
+                return json.loads(response.read().decode()).get('data', {})
+        except urllib.error.HTTPError as e:
+            err_body = e.read().decode()
+            self._log(tenant, doctype, 'error', f'Failed to update: HTTP {e.code} - {err_body}')
+            return None
+        except Exception as e:
+            self._log(tenant, doctype, 'error', f'Failed to update: {str(e)}')
+            return None
+
     def _frappe_method_post(self, tenant, method, data):
         """Call a whitelisted Frappe method via POST form-encode."""
         url = f"{tenant.frappe_url.rstrip('/')}/api/method/{method}"
@@ -243,87 +263,118 @@ class FrappeSyncEngine(models.TransientModel):
     def _pull_products_from_frappe(self, tenant):
         """Pull Frappe Items → Odoo as havanoposdesk.product records.
 
-        Only creates products that do not yet exist in Odoo (matched by
-        item_code).  Does not overwrite existing Odoo products.
+        - Creates products that do not yet exist in Odoo (matched by item_code).
+        - Updates existing Odoo products when price, UOM, or name variances
+          are detected in Frappe (variance sync).
         """
         frappe_items = self._frappe_get(tenant, 'Item', limit=2000)
         if not frappe_items:
             return {'synced': 0, 'skipped': 0}
 
-        # Build a fast lookup of existing Odoo products by item_code for this tenant
+        # Build lookup: item_code → Odoo product record
         existing_products = self.env['havanoposdesk.product'].sudo().search([
             ('tenant_id', '=', tenant.id)
         ])
-        existing_codes = {p.item_code for p in existing_products if p.item_code}
-        existing_names = {p.name.lower() for p in existing_products}
+        code_to_product = {p.item_code: p for p in existing_products if p.item_code}
+        name_to_product = {p.name.lower(): p for p in existing_products}
 
         # Find the tenant's default category
         default_category = self.env['havanoposdesk.category'].sudo().search([
             ('tenant_id', '=', tenant.id)
         ], limit=1)
 
-        count = 0
+        created = 0
+        updated = 0
         skipped = 0
         errors = 0
+
         for item in frappe_items:
             item_code = item.get('item_code') or item.get('name', '')
             item_name = item.get('item_name') or item_code
+            frappe_sell  = float(item.get('standard_rate') or 0.0)
+            frappe_buy   = float(item.get('valuation_rate') or 0.0)
+            frappe_track = bool(item.get('is_stock_item', 1))
+            frappe_notes = item.get('description') or ''
+            uom_name     = item.get('stock_uom') or 'Each'
+            uom          = self._get_or_create_odoo_uom(tenant, uom_name)
 
-            # Skip if already in Odoo (by code or by name)
-            if item_code in existing_codes or item_name.lower() in existing_names:
-                skipped += 1
+            # --- UPDATE existing product if values differ (variance sync) ---
+            odoo_product = code_to_product.get(item_code) or name_to_product.get(item_name.lower())
+            if odoo_product:
+                update_vals = {}
+                if abs(odoo_product.selling_price - frappe_sell) > 0.001:
+                    update_vals['selling_price'] = frappe_sell
+                if abs(odoo_product.buying_price - frappe_buy) > 0.001:
+                    update_vals['buying_price'] = frappe_buy
+                if odoo_product.track_qty != frappe_track:
+                    update_vals['track_qty'] = frappe_track
+                if uom.id and odoo_product.uom_id.id != uom.id:
+                    update_vals['uom_id'] = uom.id
+                if frappe_notes and odoo_product.internal_notes != frappe_notes:
+                    update_vals['internal_notes'] = frappe_notes
+
+                if update_vals:
+                    try:
+                        odoo_product.sudo().write(update_vals)
+                        updated += 1
+                    except Exception as e:
+                        errors += 1
+                        self._log(tenant, 'Item (pull)', 'error',
+                                  f'Failed to update product "{item_name}": {str(e)}')
+                else:
+                    skipped += 1
                 continue
 
-            # Resolve / create UOM
-            uom_name = item.get('stock_uom') or 'Each'
-            uom = self._get_or_create_odoo_uom(tenant, uom_name)
-
+            # --- CREATE new product ---
             try:
                 vals = {
                     'item_code': item_code,
                     'name': item_name,
-                    'selling_price': float(item.get('standard_rate') or 0.0),
-                    'buying_price': float(item.get('valuation_rate') or 0.0),
-                    'track_qty': bool(item.get('is_stock_item', 1)),
+                    'selling_price': frappe_sell,
+                    'buying_price': frappe_buy,
+                    'track_qty': frappe_track,
                     'is_active': True,
                     'uom_id': uom.id,
                     'tenant_id': tenant.id,
-                    'internal_notes': item.get('description') or '',
+                    'internal_notes': frappe_notes,
                 }
                 if default_category:
                     vals['category_id'] = default_category.id
 
-                self.env['havanoposdesk.product'].sudo().create(vals)
-                # Track so duplicates within the same batch are also skipped
-                existing_codes.add(item_code)
-                existing_names.add(item_name.lower())
-                count += 1
+                new_prod = self.env['havanoposdesk.product'].sudo().create(vals)
+                code_to_product[item_code] = new_prod
+                name_to_product[item_name.lower()] = new_prod
+                created += 1
             except Exception as e:
                 errors += 1
                 self._log(tenant, 'Item (pull)', 'error',
                           f'Failed to create product "{item_name}" from Frappe: {str(e)}')
 
-        if count > 0:
+        total = created + updated
+        if total > 0:
             self._log(tenant, 'Item (pull)', 'success',
-                      f'Pulled {count} products from Frappe into Odoo (errors: {errors})', count)
+                      f'Pulled from Frappe: {created} created, {updated} updated (errors: {errors})', total)
         elif errors > 0:
             self._log(tenant, 'Item (pull)', 'error',
                       f'Failed to pull some products from Frappe. Errors: {errors}')
-        return {'synced': count, 'skipped': skipped}
+        return {'synced': total, 'skipped': skipped}
 
     def _sync_products(self, tenant):
-        """Push Odoo products TO Frappe as Items."""
-        # Fetch existing Frappe items - match on both item_code and name
-        frappe_items = self._frappe_get(tenant, 'Item', limit=2000)
-        frappe_item_codes = set()
-        for i in frappe_items:
-            if i.get('item_code'):
-                frappe_item_codes.add(i['item_code'])
-            if i.get('name'):
-                frappe_item_codes.add(i['name'])
+        """Push Odoo products TO Frappe as Items.
+
+        - Creates new Frappe Items for products not yet in Frappe.
+        - Updates existing Frappe Items when Odoo price, UOM, or name
+          variances are detected (variance sync).
+        """
+        # Fetch existing Frappe items as a map: item_code → item dict
+        frappe_items_list = self._frappe_get(tenant, 'Item', limit=2000)
+        frappe_item_map = {}
+        for i in frappe_items_list:
+            code = i.get('item_code') or i.get('name', '')
+            if code:
+                frappe_item_map[code] = i
 
         item_group = self._get_frappe_item_group(tenant)
-        # Cache fallback UOM once
         fallback_uom = self._get_frappe_uom(tenant)
 
         products = self.env['havanoposdesk.product'].search([
@@ -331,43 +382,65 @@ class FrappeSyncEngine(models.TransientModel):
             ('is_active', '=', True)
         ])
 
-        count = 0
+        created = 0
+        updated = 0
         skipped = 0
         errors = 0
+
         for product in products:
             code = product.item_code or product.name
-            # Skip if already in Frappe
-            if code in frappe_item_codes:
-                skipped += 1
-                continue
-
-            # Use the product's own UOM; fall back to a generic UOM if not mapped
             product_uom_name = product.uom_id.name if product.uom_id else None
             stock_uom = self._get_frappe_uom(tenant, preferred_name=product_uom_name) if product_uom_name else fallback_uom
 
-            item_data = {
-                'item_code': code,
-                'item_name': product.name,
-                'item_group': item_group,
-                'stock_uom': stock_uom,
-                'standard_rate': product.selling_price,
-                'valuation_rate': product.buying_price,
-                'is_stock_item': 1 if product.track_qty else 0,
-                'description': product.internal_notes or product.name,
-            }
-            res = self._frappe_post(tenant, 'Item', item_data)
-            if res and res.get('name'):
-                count += 1
-            else:
-                errors += 1
-                self._log(tenant, 'Item', 'error',
-                          f'Failed to push product "{product.name}" (code={code}, uom={stock_uom})')
+            if code in frappe_item_map:
+                # --- UPDATE existing Frappe item if values differ (variance sync) ---
+                existing = frappe_item_map[code]
+                update_data = {}
+                if abs(float(existing.get('standard_rate') or 0.0) - product.selling_price) > 0.001:
+                    update_data['standard_rate'] = product.selling_price
+                if abs(float(existing.get('valuation_rate') or 0.0) - product.buying_price) > 0.001:
+                    update_data['valuation_rate'] = product.buying_price
+                if (existing.get('item_name') or '') != product.name:
+                    update_data['item_name'] = product.name
+                if (existing.get('stock_uom') or '').lower() != stock_uom.lower():
+                    update_data['stock_uom'] = stock_uom
 
-        if count > 0:
-            self._log(tenant, 'Item', 'success', f'Pushed {count} products to Frappe (errors: {errors})', count)
+                if update_data:
+                    res = self._frappe_put(tenant, 'Item', code, update_data)
+                    if res and res.get('name'):
+                        updated += 1
+                    else:
+                        errors += 1
+                else:
+                    skipped += 1
+            else:
+                # --- CREATE new Frappe item ---
+                item_data = {
+                    'item_code': code,
+                    'item_name': product.name,
+                    'item_group': item_group,
+                    'stock_uom': stock_uom,
+                    'standard_rate': product.selling_price,
+                    'valuation_rate': product.buying_price,
+                    'is_stock_item': 1 if product.track_qty else 0,
+                    'description': product.internal_notes or product.name,
+                }
+                res = self._frappe_post(tenant, 'Item', item_data)
+                if res and res.get('name'):
+                    created += 1
+                else:
+                    errors += 1
+                    self._log(tenant, 'Item', 'error',
+                              f'Failed to push product "{product.name}" (code={code}, uom={stock_uom})')
+
+        total = created + updated
+        if total > 0:
+            self._log(tenant, 'Item', 'success',
+                      f'Pushed to Frappe: {created} created, {updated} updated (errors: {errors})', total)
         elif errors > 0:
-            self._log(tenant, 'Item', 'error', f'Failed to push some items. Check Frappe Item module integrity. Errors: {errors}')
-        return {'synced': count, 'skipped': skipped}
+            self._log(tenant, 'Item', 'error',
+                      f'Failed to push some items. Errors: {errors}')
+        return {'synced': total, 'skipped': skipped}
 
     def _sync_customers(self, tenant):
         """Push Odoo customers TO Frappe."""
