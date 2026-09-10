@@ -662,6 +662,27 @@ class FrappeSyncEngine(models.TransientModel):
         res = self._frappe_post(tenant, 'Item', item_data)
         return bool(res and res.get('name'))
 
+    def _ensure_frappe_warehouse_exists(self, tenant, store_name, wh_name_to_id):
+        """Ensure a warehouse exists in Frappe, create if not."""
+        if not store_name:
+            store_name = 'Main Store'
+            
+        # If it's already mapped, we have the Frappe ID
+        for wh_name, wh_id in wh_name_to_id.items():
+            if wh_name.lower() == store_name.lower():
+                return wh_id
+                
+        # Create it in Frappe
+        wh_data = {
+            'warehouse_name': store_name,
+            'company': self._get_frappe_company(tenant),
+        }
+        res = self._frappe_post(tenant, 'Warehouse', wh_data)
+        if res and res.get('name'):
+            wh_name_to_id[store_name] = res.get('name')
+            return res.get('name')
+        return None
+
     def _sync_sales(self, tenant):
         """Push Odoo sales to Frappe as Sales Invoices."""
         frappe_invoices = self._frappe_get(tenant, 'Sales Invoice', limit=2000)
@@ -720,7 +741,7 @@ class FrappeSyncEngine(models.TransientModel):
 
             customer_name = sale.customer.name if sale.customer else 'CASH'
             store_name = sale.store or (sale.store_id.name if sale.store_id else '')
-            frappe_wh_id = wh_name_to_id.get(store_name)
+            frappe_wh_id = self._ensure_frappe_warehouse_exists(tenant, store_name, wh_name_to_id)
 
             data = {
                 'customer': customer_name,
