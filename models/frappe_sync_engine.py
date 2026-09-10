@@ -82,7 +82,10 @@ class FrappeSyncEngine(models.TransientModel):
                 }
             }
         except Exception as e:
-            self._log(tenant, 'All Entities', 'error', str(e))
+            try:
+                self._log(tenant, 'All Entities', 'error', str(e))
+            except Exception:
+                pass  # Never let a failed log write mask the real error
             raise exceptions.UserError(f'Sync failed: {str(e)}')
 
     def _frappe_get(self, tenant, doctype, limit=500):
@@ -132,23 +135,37 @@ class FrappeSyncEngine(models.TransientModel):
             return None
 
     def _frappe_put(self, tenant, doctype, doc_name, data):
-        """PUT (update) an existing document in Frappe."""
+        """PUT (update) an existing document in Frappe.
+
+        Adds an empty 'Expect' header to suppress urllib's default
+        'Expect: 100-continue' which causes HTTP 417 on many servers.
+        """
         url = f"{tenant.frappe_url.rstrip('/')}/api/resource/{urllib.parse.quote(doctype)}/{urllib.parse.quote(str(doc_name))}"
         payload = json.dumps(data).encode('utf-8')
         req = urllib.request.Request(url, data=payload, method='PUT', headers={
             'Authorization': f'token {tenant.frappe_api_key}:{tenant.frappe_api_secret}',
             'Accept': 'application/json',
-            'Content-Type': 'application/json'
+            'Content-Type': 'application/json',
+            'Expect': '',  # Suppress 'Expect: 100-continue' — prevents HTTP 417
         })
         try:
             with urllib.request.urlopen(req, timeout=15) as response:
                 return json.loads(response.read().decode()).get('data', {})
         except urllib.error.HTTPError as e:
-            err_body = e.read().decode()
-            self._log(tenant, doctype, 'error', f'Failed to update: HTTP {e.code} - {err_body}')
+            try:
+                err_body = e.read().decode()
+            except Exception:
+                err_body = str(e)
+            try:
+                self._log(tenant, doctype, 'error', f'Failed to update: HTTP {e.code} - {err_body}')
+            except Exception:
+                pass
             return None
         except Exception as e:
-            self._log(tenant, doctype, 'error', f'Failed to update: {str(e)}')
+            try:
+                self._log(tenant, doctype, 'error', f'Failed to update: {str(e)}')
+            except Exception:
+                pass
             return None
 
     def _frappe_method_post(self, tenant, method, data):
@@ -169,13 +186,22 @@ class FrappeSyncEngine(models.TransientModel):
             return {'error': str(e)}
 
     def _log(self, tenant, entity, status, details='', records=0):
-        self.env['frappe.sync.log'].create({
-            'tenant_id': tenant.id,
-            'entity': entity,
-            'status': status,
-            'details': details,
-            'records_synced': records
-        })
+        """Write a sync log entry inside its own savepoint.
+
+        Using a savepoint ensures that a failed log write (e.g. cursor in an
+        aborted transaction) never rolls back work already done by the caller.
+        """
+        try:
+            with self.env.cr.savepoint():
+                self.env['frappe.sync.log'].create({
+                    'tenant_id': tenant.id,
+                    'entity': entity,
+                    'status': status,
+                    'details': details,
+                    'records_synced': records
+                })
+        except Exception:
+            pass  # Log failures must never crash the sync
 
     def _get_frappe_item_group(self, tenant):
         """Get a safe item group from Frappe."""
