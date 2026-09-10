@@ -94,7 +94,13 @@ class FrappeSyncEngine(models.TransientModel):
             self._log(tenant, doctype, 'error', f'Failed to fetch: {str(e)}')
             return []
 
-    def _frappe_post(self, tenant, doctype, data):
+    def _frappe_post(self, tenant, doctype, data, silent_409=False):
+        """POST a new document to Frappe.
+
+        If *silent_409* is True, a 409 Conflict (DuplicateEntryError) is
+        treated as "already exists" and returns {'exists': True} without
+        writing an error log entry.
+        """
         url = f"{tenant.frappe_url.rstrip('/')}/api/resource/{urllib.parse.quote(doctype)}"
         payload = json.dumps(data).encode('utf-8')
         req = urllib.request.Request(url, data=payload, headers={
@@ -106,6 +112,9 @@ class FrappeSyncEngine(models.TransientModel):
             with urllib.request.urlopen(req, timeout=15) as response:
                 return json.loads(response.read().decode()).get('data', {})
         except urllib.error.HTTPError as e:
+            if e.code == 409 and silent_409:
+                # Record already exists in Frappe — not an error
+                return {'exists': True}
             err_body = e.read().decode()
             self._log(tenant, doctype, 'error', f'Failed to post: HTTP {e.code} - {err_body}')
             return None
@@ -186,18 +195,24 @@ class FrappeSyncEngine(models.TransientModel):
         return uoms[0].get('name') if uoms else 'Nos'
 
     def _sync_uoms(self, tenant):
-        """Push Odoo UOMs to Frappe's UOM doctype so items can reference them."""
-        frappe_uoms = self._frappe_get(tenant, 'UOM', limit=100)
+        """Push Odoo UOMs to Frappe's UOM doctype so items can reference them.
+
+        Uses a high limit when fetching existing Frappe UOMs to reduce cache
+        misses.  Any 409 Conflict (UOM already exists) is silently ignored.
+        """
+        frappe_uoms = self._frappe_get(tenant, 'UOM', limit=500)
         frappe_uom_names = {u.get('name', '').lower(): u.get('name') for u in frappe_uoms}
 
         odoo_uoms = self.env['havanoposdesk.uom'].search([('tenant_id', '=', tenant.id)])
         pushed = 0
         for uom in odoo_uoms:
             if uom.name.lower() in frappe_uom_names:
-                continue  # Already exists
-            res = self._frappe_post(tenant, 'UOM', {'uom_name': uom.name})
+                continue  # Already exists — skip without hitting the API
+            # silent_409=True: if it sneaked in between our fetch and the POST, ignore it
+            res = self._frappe_post(tenant, 'UOM', {'uom_name': uom.name}, silent_409=True)
             if res and res.get('name'):
                 pushed += 1
+            # res == {'exists': True} means it was already there — also fine
         if pushed:
             self._log(tenant, 'UOM', 'success', f'Pushed {pushed} UOMs to Frappe', pushed)
 
