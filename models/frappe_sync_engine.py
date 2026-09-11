@@ -371,6 +371,8 @@ class FrappeSyncEngine(models.TransientModel):
             frappe_barcode = (item.get('barcode') or '').strip()
             frappe_group   = (item.get('item_group') or '').strip()
             frappe_discount = float(item.get('discount_percentage') or 0.0)
+            frappe_has_variants = bool(item.get('has_variants', 0))
+            frappe_variant_of = (item.get('variant_of') or '').strip()
 
             if not item_code:
                 continue
@@ -400,6 +402,13 @@ class FrappeSyncEngine(models.TransientModel):
                     update_vals['is_active'] = frappe_active
                 if uom.id and odoo_product.uom_id.id != uom.id:
                     update_vals['uom_id'] = uom.id
+                if odoo_product.has_variants != frappe_has_variants:
+                    update_vals['has_variants'] = frappe_has_variants
+                is_variant_val = bool(frappe_variant_of)
+                if odoo_product.is_variant != is_variant_val:
+                    update_vals['is_variant'] = is_variant_val
+                if odoo_product.frappe_variant_of != frappe_variant_of:
+                    update_vals['frappe_variant_of'] = frappe_variant_of
                 if frappe_notes and odoo_product.internal_notes != frappe_notes:
                     update_vals['internal_notes'] = frappe_notes
                 if frappe_barcode and odoo_product.barcode != frappe_barcode:
@@ -441,6 +450,9 @@ class FrappeSyncEngine(models.TransientModel):
                     'tenant_id': tenant.id,
                     'internal_notes': frappe_notes,
                     'discount_percentage': frappe_discount,
+                    'has_variants': frappe_has_variants,
+                    'is_variant': bool(frappe_variant_of),
+                    'frappe_variant_of': frappe_variant_of,
                 }
                 if category:
                     vals['category_id'] = category.id
@@ -458,6 +470,18 @@ class FrappeSyncEngine(models.TransientModel):
                 errors += 1
                 self._log(tenant, 'Item (pull)', 'error',
                           f'Failed to create "{item_name}" ({item_code}): {str(e)}')
+
+        # Second pass: link templates to variants
+        for prod in code_to_product.values():
+            if prod.is_variant and prod.frappe_variant_of:
+                template = code_to_product.get(prod.frappe_variant_of)
+                if template and prod.template_id.id != template.id:
+                    try:
+                        with self.env.cr.savepoint():
+                            prod.sudo().write({'template_id': template.id})
+                    except Exception as e:
+                        self._log(tenant, 'Item (pull linking)', 'error',
+                                  f'Failed to link variant "{prod.name}" to template "{template.name}": {str(e)}')
 
         total = created + updated
         if total > 0 or errors > 0:
@@ -517,6 +541,13 @@ class FrappeSyncEngine(models.TransientModel):
                     self._log(tenant, f'Item: {code}', 'error', f'UOM changed in Odoo to {stock_uom} but Frappe blocks UOM updates for items with transactions. You must create a new item to change the UOM.')
                 if bool(existing.get('is_stock_item', 1)) != product.track_qty:
                     update_data['is_stock_item'] = 1 if product.track_qty else 0
+                
+                if bool(existing.get('has_variants', 0)) != product.has_variants:
+                    update_data['has_variants'] = 1 if product.has_variants else 0
+                odoo_variant_of = product.template_id.item_code or product.template_id.name if product.is_variant and product.template_id else ''
+                if (existing.get('variant_of') or '') != odoo_variant_of:
+                    update_data['variant_of'] = odoo_variant_of
+
                 odoo_barcode = product.barcode or ''
                 if odoo_barcode and (existing.get('barcode') or '') != odoo_barcode:
                     update_data['barcode'] = odoo_barcode
@@ -546,7 +577,10 @@ class FrappeSyncEngine(models.TransientModel):
                     'valuation_rate': product.buying_price,
                     'is_stock_item': 1 if product.track_qty else 0,
                     'description': product.internal_notes or product.name,
+                    'has_variants': 1 if product.has_variants else 0,
                 }
+                if product.is_variant and product.template_id:
+                    item_data['variant_of'] = product.template_id.item_code or product.template_id.name
                 if product.barcode:
                     item_data['barcode'] = product.barcode
                 res = self._frappe_post(tenant, 'Item', item_data)

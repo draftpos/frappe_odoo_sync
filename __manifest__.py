@@ -22,6 +22,7 @@ Auto-syncs every minute via scheduled action.
     'data': [
         'security/ir.model.access.csv',
         'views/frappe_sync_views.xml',
+        'views/havanoposdesk_product_views.xml',
         'data/frappe_sync_cron.xml',
     ],
     'assets': {
