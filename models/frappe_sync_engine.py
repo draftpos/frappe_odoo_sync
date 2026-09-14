@@ -376,6 +376,9 @@ class FrappeSyncEngine(models.TransientModel):
 
             if not item_code:
                 continue
+                
+            if not int(item.get('is_sales_item') or 0):
+                continue
 
             # Resolve UOM
             uom_name = item.get('stock_uom') or 'Each'
@@ -512,7 +515,7 @@ class FrappeSyncEngine(models.TransientModel):
         products = self.env['havanoposdesk.product'].search([
             ('tenant_id', '=', tenant.id),
             ('is_active', '=', True),
-            ('is_selling', '=', True)
+            ('is_sales_item', '=', True)
         ])
 
         created = 0
