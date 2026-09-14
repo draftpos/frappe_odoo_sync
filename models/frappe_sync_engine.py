@@ -307,7 +307,7 @@ class FrappeSyncEngine(models.TransientModel):
 
         return uoms[0].get('name') if uoms else 'Nos'
 
-    def _sync_uoms(self, tenant):
+    def _sync_uoms(self, tenant, start_time=None):
         """Push Odoo UOMs to Frappe's UOM doctype so items can reference them.
 
         Uses a high limit when fetching existing Frappe UOMs to reduce cache
@@ -668,7 +668,7 @@ class FrappeSyncEngine(models.TransientModel):
                       total)
         return {'synced': total, 'skipped': skipped}
 
-    def _sync_customers(self, tenant):
+    def _sync_customers(self, tenant, start_time=None):
         """Push Odoo customers TO Frappe."""
         frappe_custs = self._frappe_get(tenant, 'Customer', limit=1000)
         frappe_cust_names = {c.get('customer_name', c.get('name', '')): True for c in frappe_custs}
@@ -713,7 +713,7 @@ class FrappeSyncEngine(models.TransientModel):
             self._log(tenant, 'Customer', 'success', f'Pushed {count} customers to Frappe', count)
         return {'synced': count, 'skipped': skipped}
 
-    def _pull_stores_from_frappe(self, tenant):
+    def _pull_stores_from_frappe(self, tenant, start_time=None):
         """Pull Frappe Warehouses -> Odoo Stores (havanoposdesk.store)"""
         frappe_warehouses = self._frappe_get(tenant, 'Warehouse', limit=500)
         if not frappe_warehouses:
@@ -769,7 +769,7 @@ class FrappeSyncEngine(models.TransientModel):
                       f'Frappe → Odoo: {created} created, {updated} updated, {skipped} existing, {errors} errors', total)
         return {'synced': total, 'skipped': skipped}
 
-    def _sync_stores(self, tenant):
+    def _sync_stores(self, tenant, start_time=None):
         """Push Odoo stores TO Frappe as Warehouses."""
         frappe_warehouses = self._frappe_get(tenant, 'Warehouse', limit=200)
         frappe_wh_names = {w.get('warehouse_name', w.get('name', '')): True for w in frappe_warehouses}
@@ -1050,7 +1050,7 @@ class FrappeSyncEngine(models.TransientModel):
                       f'Frappe → Odoo: {created} created, {updated} updated, {skipped} existing, {errors} errors', total)
         return {'synced': total, 'skipped': skipped}
 
-    def _sync_users(self, tenant):
+    def _sync_users(self, tenant, start_time=None):
         """Push Odoo res.users -> Frappe User"""
         frappe_users_list = self._frappe_get(tenant, 'User', limit=1000)
         frappe_user_map = {}
