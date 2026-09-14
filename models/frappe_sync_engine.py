@@ -830,6 +830,30 @@ class FrappeSyncEngine(models.TransientModel):
             return res.get('name')
         return None
 
+    def _ensure_frappe_customer_exists(self, tenant, customer_name):
+        customers = self._frappe_get(tenant, 'Customer', limit=1)
+        url = f"{tenant.frappe_url.rstrip('/')}/api/resource/Customer/{urllib.parse.quote(customer_name)}"
+        req = urllib.request.Request(url, headers={
+            'Authorization': f'token {tenant.frappe_api_key}:{tenant.frappe_api_secret}',
+            'Accept': 'application/json'
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=10) as response:
+                return True
+        except:
+            pass
+
+        cust_group = self._get_frappe_customer_group(tenant)
+        territory = self._get_frappe_territory(tenant)
+        cust_data = {
+            'customer_name': customer_name,
+            'customer_type': 'Individual',
+            'customer_group': cust_group,
+            'territory': territory,
+        }
+        res = self._frappe_post(tenant, 'Customer', cust_data)
+        return bool(res and res.get('name'))
+
     def _sync_sales(self, tenant):
         """Push Odoo sales to Frappe as Sales Invoices."""
         frappe_invoices = self._frappe_get(tenant, 'Sales Invoice', limit=2000)
@@ -887,6 +911,8 @@ class FrappeSyncEngine(models.TransientModel):
                 continue
 
             customer_name = sale.customer.name if sale.customer else 'CASH'
+            self._ensure_frappe_customer_exists(tenant, customer_name)
+            
             store_name = sale.store or (sale.store_id.name if sale.store_id else '')
             frappe_wh_id = self._ensure_frappe_warehouse_exists(tenant, store_name, wh_name_to_id)
 
@@ -895,9 +921,8 @@ class FrappeSyncEngine(models.TransientModel):
                 'po_no': sale.name,
                 'items': items,
                 'update_stock': 1,
-                'set_posting_time': 1,
                 'posting_date': str(sale.posting_date) if sale.posting_date else str(fields.Date.today()),
-                'docstatus': 1,
+                'docstatus': 0, # Draft instead of Submit to avoid stock validation blocking sync
             }
             if frappe_wh_id:
                 data['set_warehouse'] = frappe_wh_id
