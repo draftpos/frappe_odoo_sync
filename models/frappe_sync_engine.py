@@ -47,23 +47,23 @@ class FrappeSyncEngine(models.TransientModel):
         start_time = time.time()
         try:
             # 1. Sync UOMs first so Frappe has them before products/sales reference them
-            self._sync_uoms(tenant)
+            self._sync_uoms(tenant, start_time=start_time)
 
             # 2. Pull Frappe Items → Odoo (bidirectional product sync)
-            pull_res = self._pull_products_from_frappe(tenant)
+            pull_res = self._pull_products_from_frappe(tenant, start_time=start_time)
             
             # 3. Pull Frappe Users → Odoo
-            u_pull_res = self._pull_users_from_frappe(tenant)
+            u_pull_res = self._pull_users_from_frappe(tenant, start_time=start_time)
 
             # 4. Pull Frappe Warehouses → Odoo Stores
-            st_pull_res = self._pull_stores_from_frappe(tenant)
+            st_pull_res = self._pull_stores_from_frappe(tenant, start_time=start_time)
 
             # 5. Push Odoo data → Frappe
-            p_res = self._sync_products(tenant)
-            c_res = self._sync_customers(tenant)
-            s_res = self._sync_stores(tenant)
-            sa_res = self._sync_sales(tenant)
-            u_push_res = self._sync_users(tenant)
+            p_res = self._sync_products(tenant, start_time=start_time)
+            c_res = self._sync_customers(tenant, start_time=start_time)
+            s_res = self._sync_stores(tenant, start_time=start_time)
+            sa_res = self._sync_sales(tenant, start_time=start_time)
+            u_push_res = self._sync_users(tenant, start_time=start_time)
 
             pull_s, pull_sk = pull_res['synced'], pull_res['skipped']
             u_pull_s, u_pull_sk = u_pull_res['synced'], u_pull_res['skipped']
@@ -367,7 +367,7 @@ class FrappeSyncEngine(models.TransientModel):
                 )
         return cat
 
-    def _pull_products_from_frappe(self, tenant):
+    def _pull_products_from_frappe(self, tenant, start_time=None):
         """Pull Frappe Items → Odoo as havanoposdesk.product records.
 
         Full variance sync — creates new products AND updates ALL changed
@@ -407,7 +407,17 @@ class FrappeSyncEngine(models.TransientModel):
         skipped = 0
         errors = 0
 
-        for item in frappe_items:
+        for i, item in enumerate(frappe_items):
+            if start_time and time.time() - start_time > 50:
+                self._log(tenant, 'Item (pull)', 'skipped', 'Time limit reached. Yielding to prevent server restart.')
+                break
+            
+            if i > 0 and i % 50 == 0:
+                try:
+                    self.env.cr.commit()
+                except Exception:
+                    pass
+
             item_code    = (item.get('item_code') or item.get('name') or '').strip()
             item_name    = (item.get('item_name') or item_code).strip()
             frappe_sell  = float(item.get('standard_rate') or 0.0)
@@ -540,7 +550,7 @@ class FrappeSyncEngine(models.TransientModel):
                       total)
         return {'synced': total, 'skipped': skipped}
 
-    def _sync_products(self, tenant):
+    def _sync_products(self, tenant, start_time=None):
         """Push Odoo products TO Frappe as Items.
 
         Full variance sync — creates new AND updates changed fields:
@@ -570,7 +580,16 @@ class FrappeSyncEngine(models.TransientModel):
         skipped = 0
         errors = 0
 
-        for product in products:
+        for i, product in enumerate(products):
+            if start_time and time.time() - start_time > 50:
+                self._log(tenant, 'Item (push)', 'skipped', 'Time limit reached. Yielding to prevent server restart.')
+                break
+                
+            if i > 0 and i % 50 == 0:
+                try:
+                    self.env.cr.commit()
+                except Exception:
+                    pass
             code = product.item_code or product.name
             product_uom_name = product.uom_id.name if product.uom_id else None
             stock_uom = self._get_frappe_uom(tenant, preferred_name=product_uom_name) if product_uom_name else fallback_uom
@@ -854,7 +873,7 @@ class FrappeSyncEngine(models.TransientModel):
         res = self._frappe_post(tenant, 'Customer', cust_data)
         return bool(res and res.get('name'))
 
-    def _sync_sales(self, tenant):
+    def _sync_sales(self, tenant, start_time=None):
         """Push Odoo sales to Frappe as Sales Invoices."""
         frappe_invoices = self._frappe_get(tenant, 'Sales Invoice', limit=2000)
         synced_sales = {inv.get('po_no'): True for inv in frappe_invoices if inv.get('po_no')}
@@ -873,7 +892,16 @@ class FrappeSyncEngine(models.TransientModel):
 
         count = 0
         skipped = 0
-        for sale in sales:
+        for i, sale in enumerate(sales):
+            if start_time and time.time() - start_time > 50:
+                self._log(tenant, 'Sales (push)', 'skipped', 'Time limit reached. Yielding to prevent server restart.')
+                break
+                
+            if i > 0 and i % 20 == 0:
+                try:
+                    self.env.cr.commit()
+                except Exception:
+                    pass
             if sale.name in synced_sales:
                 skipped += 1
                 continue
@@ -938,7 +966,7 @@ class FrappeSyncEngine(models.TransientModel):
             self._log(tenant, 'Sales Invoice', 'success', f'Pushed {count} sales to Frappe', count)
         return {'synced': count, 'skipped': skipped}
 
-    def _pull_users_from_frappe(self, tenant):
+    def _pull_users_from_frappe(self, tenant, start_time=None):
         """Pull Frappe Users -> Odoo res.users (tenant specific)"""
         frappe_users = self._frappe_get(tenant, 'User', limit=1000)
         if not frappe_users:
@@ -955,7 +983,16 @@ class FrappeSyncEngine(models.TransientModel):
         # Don't sync internal Frappe users
         ignore_emails = ['Administrator', 'Guest']
 
-        for f_user in frappe_users:
+        for i, f_user in enumerate(frappe_users):
+            if start_time and time.time() - start_time > 50:
+                self._log(tenant, 'User (pull)', 'skipped', 'Time limit reached. Yielding to prevent server restart.')
+                break
+                
+            if i > 0 and i % 50 == 0:
+                try:
+                    self.env.cr.commit()
+                except Exception:
+                    pass
             email = (f_user.get('email') or f_user.get('name') or '').strip()
             if not email or email in ignore_emails or '@' not in email:
                 continue
