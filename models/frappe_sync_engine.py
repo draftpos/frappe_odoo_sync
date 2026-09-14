@@ -511,7 +511,8 @@ class FrappeSyncEngine(models.TransientModel):
 
         products = self.env['havanoposdesk.product'].search([
             ('tenant_id', '=', tenant.id),
-            ('is_active', '=', True)
+            ('is_active', '=', True),
+            ('is_selling', '=', True)
         ])
 
         created = 0
