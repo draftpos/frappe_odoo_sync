@@ -25,3 +25,7 @@ class TenantFrappeSettings(models.Model):
     def action_sync_now(self):
         self.ensure_one()
         return self.env['frappe.sync.engine'].sync_tenant(self)
+
+    def action_revert_non_sales_items(self):
+        self.ensure_one()
+        return self.env['frappe.sync.engine'].revert_non_sales_items(self)

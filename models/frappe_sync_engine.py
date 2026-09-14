@@ -99,6 +99,53 @@ class FrappeSyncEngine(models.TransientModel):
                 pass  # Never let a failed log write mask the real error
             raise exceptions.UserError(f'Sync failed: {str(e)}')
 
+    @api.model
+    def revert_non_sales_items(self, tenant):
+        """Find items in Frappe that are NOT is_sales_item, and deactivate them in Odoo if they exist."""
+        try:
+            frappe_items = self._frappe_get(tenant, 'Item', limit=5000)
+            if not frappe_items:
+                return
+
+            non_sales_codes = []
+            non_sales_names = []
+            for item in frappe_items:
+                if not int(item.get('is_sales_item') or 0):
+                    item_code = (item.get('item_code') or item.get('name') or '').strip()
+                    item_name = (item.get('item_name') or item_code).strip()
+                    if item_code:
+                        non_sales_codes.append(item_code)
+                    if item_name:
+                        non_sales_names.append(item_name.lower())
+
+            existing_products = self.env['havanoposdesk.product'].sudo().search([
+                ('tenant_id', '=', tenant.id),
+                ('is_active', '=', True)
+            ])
+
+            reverted_count = 0
+            for prod in existing_products:
+                if (prod.item_code and prod.item_code in non_sales_codes) or \
+                   (prod.name and prod.name.lower() in non_sales_names):
+                    prod.write({'is_active': False})
+                    reverted_count += 1
+
+            msg = f"Successfully reverted {reverted_count} non-sales items."
+            self._log(tenant, 'Revert', 'success', msg)
+            return {
+                'type': 'ir.actions.client',
+                'tag': 'display_notification',
+                'params': {
+                    'title': 'Revert Complete',
+                    'message': msg,
+                    'type': 'success',
+                    'sticky': False,
+                }
+            }
+        except Exception as e:
+            self._log(tenant, 'Revert', 'error', str(e))
+            raise exceptions.UserError(f'Revert failed: {str(e)}')
+
     def _frappe_get(self, tenant, doctype, limit=500):
         url = f"{tenant.frappe_url.rstrip('/')}/api/resource/{urllib.parse.quote(doctype)}?limit_page_length={limit}&fields=[\"*\"]"
         req = urllib.request.Request(url, headers={

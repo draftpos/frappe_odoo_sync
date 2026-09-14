@@ -17,6 +17,7 @@
                     </group>
                     <button string="Test Connection" type="object" name="action_test_frappe_connection" class="oe_highlight btn-info" icon="fa-plug"/>
                     <button string="Sync Now" type="object" name="action_sync_now" class="oe_highlight btn-success" icon="fa-refresh"/>
+                    <button string="Revert Non-Sales Products" type="object" name="action_revert_non_sales_items" class="btn-warning" icon="fa-eraser" confirm="This will deactivate all synced products in Odoo that do not have 'Allow Sales' checked in Frappe. Continue?"/>
                     
                     <field name="frappe_sync_log_ids" readonly="1" class="mt-4">
                         <list string="Sync Logs" default_order="create_date desc" decoration-success="status == 'success'" decoration-danger="status == 'error'" decoration-info="status == 'skipped'">
