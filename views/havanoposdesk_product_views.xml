@@ -11,7 +11,7 @@
                 <field name="template_id" invisible="is_variant == False" class="border-bottom border-dark" options="{'no_create': True, 'no_create_edit': True}"/>
             </xpath>
             
-            <xpath expr="//page[.//field[@name='item_code']]" position="after">
+            <xpath expr="//notebook" position="inside">
                 <page string="Variance" name="variance" invisible="has_variants == False">
                     <field name="variant_ids">
                         <list>
