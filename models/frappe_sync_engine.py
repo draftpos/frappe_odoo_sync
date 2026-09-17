@@ -2,6 +2,7 @@ import json
 import time
 import urllib.request
 import urllib.parse
+import urllib.error
 from odoo import models, fields, api
 from odoo import exceptions
 
@@ -390,7 +391,7 @@ class FrappeSyncEngine(models.TransientModel):
             ('tenant_id', '=', tenant.id)
         ])
         code_to_product = {p.item_code: p for p in existing_products if p.item_code}
-        name_to_product = {p.name.lower(): p for p in existing_products}
+        name_to_product = {p.name.lower(): p for p in existing_products if p.name}
 
         # Default category fallback
         default_category = self.env['havanoposdesk.category'].sudo().search([
@@ -614,7 +615,7 @@ class FrappeSyncEngine(models.TransientModel):
                 
                 if bool(existing.get('has_variants', 0)) != product.has_variants:
                     update_data['has_variants'] = 1 if product.has_variants else 0
-                odoo_variant_of = product.template_id.item_code or product.template_id.name if product.is_variant and product.template_id else ''
+                odoo_variant_of = (product.template_id.item_code or product.template_id.name or '') if product.is_variant and product.template_id else ''
                 if (existing.get('variant_of') or '') != odoo_variant_of:
                     update_data['variant_of'] = odoo_variant_of
 
@@ -650,7 +651,7 @@ class FrappeSyncEngine(models.TransientModel):
                     'has_variants': 1 if product.has_variants else 0,
                 }
                 if product.is_variant and product.template_id:
-                    item_data['variant_of'] = product.template_id.item_code or product.template_id.name
+                    item_data['variant_of'] = product.template_id.item_code or product.template_id.name or ''
                 if product.barcode:
                     item_data['barcode'] = product.barcode
                 res = self._frappe_post(tenant, 'Item', item_data)
