@@ -5,13 +5,13 @@
         <field name="model">havanoposdesk.product</field>
         <field name="inherit_id" ref="havanoposdesk_odoo.view_havanoposdesk_product_form"/>
         <field name="arch" type="xml">
-            <xpath expr="//group[@string='Product information']" position="inside">
+            <xpath expr="//field[@name='item_code']/.." position="inside">
                 <field name="has_variants" class="border-bottom border-dark"/>
                 <field name="is_variant" class="border-bottom border-dark"/>
                 <field name="template_id" invisible="is_variant == False" class="border-bottom border-dark" options="{'no_create': True, 'no_create_edit': True}"/>
             </xpath>
             
-            <xpath expr="//page[@string='Details']" position="after">
+            <xpath expr="//page[.//field[@name='item_code']]" position="after">
                 <page string="Variance" name="variance" invisible="has_variants == False">
                     <field name="variant_ids">
                         <list>
