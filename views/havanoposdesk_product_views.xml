@@ -1,7 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
 <odoo>
-    <!-- TEMPORARILY DISABLED: The base view on the live server is throwing an 'allocate_qty' error.
-         Commenting this out so the sync module can install without crashing Odoo.
     <record id="view_havanoposdesk_product_form_inherit_variants" model="ir.ui.view">
         <field name="name">havanoposdesk.product.form.inherit.variants</field>
         <field name="model">havanoposdesk.product</field>
@@ -14,8 +12,8 @@
             </xpath>
             
             <xpath expr="//notebook" position="inside">
-                <page string="Variance" name="variance" invisible="has_variants == False">
-                    <field name="variant_ids">
+                <page string="Frappe Variants" name="frappe_variants" invisible="has_variants == False">
+                    <field name="frappe_variant_ids">
                         <list>
                             <field name="name"/>
                             <field name="item_code"/>
@@ -28,5 +26,4 @@
             </xpath>
         </field>
     </record>
-    -->
 </odoo>

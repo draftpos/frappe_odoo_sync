@@ -3,8 +3,12 @@ import time
 import urllib.request
 import urllib.parse
 import urllib.error
+import traceback
+import logging
 from odoo import models, fields, api
 from odoo import exceptions
+
+_logger = logging.getLogger(__name__)
 
 class FrappeSyncEngine(models.TransientModel):
     _name = 'frappe.sync.engine'
@@ -463,8 +467,7 @@ class FrappeSyncEngine(models.TransientModel):
                     update_vals['is_active'] = frappe_active
                 if uom.id and odoo_product.uom_id.id != uom.id:
                     update_vals['uom_id'] = uom.id
-                if odoo_product.has_variants != frappe_has_variants:
-                    update_vals['has_variants'] = frappe_has_variants
+
                 is_variant_val = bool(frappe_variant_of)
                 if odoo_product.is_variant != is_variant_val:
                     update_vals['is_variant'] = is_variant_val
@@ -511,7 +514,7 @@ class FrappeSyncEngine(models.TransientModel):
                     'tenant_id': tenant.id,
                     'internal_notes': frappe_notes,
                     'discount_percentage': frappe_discount,
-                    'has_variants': frappe_has_variants,
+
                     'is_variant': bool(frappe_variant_of),
                     'frappe_variant_of': frappe_variant_of,
                 }
@@ -529,6 +532,7 @@ class FrappeSyncEngine(models.TransientModel):
                 created += 1
             except Exception as e:
                 errors += 1
+                _logger.error(f"Failed to create item {item_name}:\n{traceback.format_exc()}")
                 self._log(tenant, 'Item (pull)', 'error',
                           f'Failed to create "{item_name}" ({item_code}): {str(e)}')
 
@@ -573,7 +577,7 @@ class FrappeSyncEngine(models.TransientModel):
         products = self.env['havanoposdesk.product'].search([
             ('tenant_id', '=', tenant.id),
             ('is_active', '=', True),
-            ('is_sales_item', '=', True)
+            ('not_for_sale', '=', False)
         ])
 
         created = 0
@@ -608,13 +612,21 @@ class FrappeSyncEngine(models.TransientModel):
                     update_data['item_name'] = product.name
                 if (existing.get('stock_uom') or '').lower() != stock_uom.lower():
                     # Frappe strictly blocks changing Default UOM if stock transactions exist.
-                    # We log a warning but skip syncing this specific field so the rest of the sync doesn't crash.
-                    self._log(tenant, f'Item: {code}', 'error', f'UOM changed in Odoo to {stock_uom} but Frappe blocks UOM updates for items with transactions. You must create a new item to change the UOM.')
+                    # We log as 'skipped' (not 'error') so the sync dashboard stays clean.
+                    # The rest of the product fields (price, name, etc.) will still sync.
+                    self._log(tenant, f'Item: {code}', 'skipped', f'UOM mismatch: Odoo={stock_uom}, Frappe={existing.get("stock_uom")}. Frappe blocks UOM changes for items with transactions – skipping UOM update.')
                 if bool(existing.get('is_stock_item', 1)) != product.track_qty:
                     update_data['is_stock_item'] = 1 if product.track_qty else 0
                 
                 if bool(existing.get('has_variants', 0)) != product.has_variants:
                     update_data['has_variants'] = 1 if product.has_variants else 0
+                
+                # Sync Active Status (Frappe's 'disabled' is inverse of Odoo's 'is_active')
+                frappe_is_disabled = bool(existing.get('disabled', 0))
+                odoo_is_disabled = not bool(product.is_active)
+                if frappe_is_disabled != odoo_is_disabled:
+                    update_data['disabled'] = 1 if odoo_is_disabled else 0
+
                 odoo_variant_of = (product.template_id.item_code or product.template_id.name or '') if product.is_variant and product.template_id else ''
                 if (existing.get('variant_of') or '') != odoo_variant_of:
                     update_data['variant_of'] = odoo_variant_of
@@ -649,6 +661,7 @@ class FrappeSyncEngine(models.TransientModel):
                     'is_stock_item': 1 if product.track_qty else 0,
                     'description': product.internal_notes or product.name,
                     'has_variants': 1 if product.has_variants else 0,
+                    'disabled': 1 if not product.is_active else 0,
                 }
                 if product.is_variant and product.template_id:
                     item_data['variant_of'] = product.template_id.item_code or product.template_id.name or ''
