@@ -24,9 +24,11 @@ class HavanoposdeskProductExt(models.Model):
                 record.buying_price = sum(item.subtotal_cost for item in record.bundle_item_ids)
                 record.selling_price = sum(item.subtotal_selling for item in record.bundle_item_ids)
 
-    template_id = fields.Many2one('havanoposdesk.product', string='Template', domain="[('has_variants', '=', True)]", help="The parent product template.")
-    frappe_variant_ids = fields.One2many('havanoposdesk.product', 'template_id', string='Frappe Variants')
-    
     # Store Frappe's variant_of temporarily during sync before linking the relation
     frappe_variant_of = fields.Char(string="Frappe Variant Of", help="Used internally for syncing.")
 
+class HavanoposdeskProductVariantExt(models.Model):
+    _inherit = 'havanoposdesk.product.variant'
+
+    item_code = fields.Char(string='Item Code', help="Frappe Item Code for this variant")
+    is_active = fields.Boolean(string='Active', default=True)

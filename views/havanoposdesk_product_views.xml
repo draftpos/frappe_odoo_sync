@@ -8,22 +8,9 @@
             <xpath expr="//field[@name='item_code']/.." position="inside">
                 <field name="has_variants" class="border-bottom border-dark"/>
                 <field name="is_variant" class="border-bottom border-dark"/>
-                <field name="template_id" invisible="is_variant == False" class="border-bottom border-dark" options="{'no_create': True, 'no_create_edit': True}"/>
             </xpath>
             
-            <xpath expr="//notebook" position="inside">
-                <page string="Frappe Variants" name="frappe_variants" invisible="has_variants == False">
-                    <field name="frappe_variant_ids">
-                        <list>
-                            <field name="name"/>
-                            <field name="item_code"/>
-                            <field name="selling_price"/>
-                            <field name="buying_price"/>
-                            <field name="on_hand_qty"/>
-                        </list>
-                    </field>
-                </page>
-            </xpath>
+            <!-- Removed frappe_variants notebook page as variants are mapped natively -->
         </field>
     </record>
 </odoo>
