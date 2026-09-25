@@ -14,8 +14,8 @@ class TenantFrappeSettings(models.Model):
         string='Frappe URL', 
         help='e.g., http://127.0.0.1:8002'
     )
-    frappe_api_key = fields.Char(string='API Key')
-    frappe_api_secret = fields.Char(string='API Secret')
+    frappe_api_key = fields.Char(string='Frappe API Key')
+    frappe_api_secret = fields.Char(string='Frappe API Secret')
     frappe_sync_log_ids = fields.One2many('frappe.sync.log', 'tenant_id', string='Sync Logs')
 
     def action_test_frappe_connection(self):

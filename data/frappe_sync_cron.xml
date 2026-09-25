@@ -10,4 +10,13 @@
         
         <field name="active" eval="True"/>
     </record>
+    <record id="ir_cron_frappe_sync_autovacuum" model="ir.cron">
+        <field name="name">Frappe Sync Log Autovacuum</field>
+        <field name="model_id" ref="model_frappe_sync_log"/>
+        <field name="state">code</field>
+        <field name="code">model.autovacuum_logs(days_to_keep=7)</field>
+        <field name="interval_number">1</field>
+        <field name="interval_type">days</field>
+        <field name="active" eval="True"/>
+    </record>
 </odoo>

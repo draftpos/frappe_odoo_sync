@@ -63,6 +63,9 @@ class FrappeSyncEngine(models.TransientModel):
             # 4. Pull Frappe Warehouses → Odoo Stores
             st_pull_res = self._pull_stores_from_frappe(tenant, start_time=start_time)
 
+            # 4.5. Pull Frappe Stock → Odoo Stock Valuations
+            stock_pull_res = self._pull_stock_from_frappe(tenant, start_time=start_time)
+
             # 5. Push Odoo data → Frappe
             p_res = self._sync_products(tenant, start_time=start_time)
             c_res = self._sync_customers(tenant, start_time=start_time)
@@ -80,11 +83,18 @@ class FrappeSyncEngine(models.TransientModel):
             sa_s, sa_sk = sa_res['synced'], sa_res['skipped']
             u_push_s, u_push_sk = u_push_res['synced'], u_push_res['skipped']
 
-            msg = (
-                f'Pulled from Frappe: {pull_s} Products (skipped: {pull_sk}), {u_pull_s} Users (skipped: {u_pull_sk}), {st_pull_s} Stores (skipped: {st_pull_sk}).\n'
-                f'Pushed to Frappe: {p_s} Products, {c_s} Customers, {s_s} Stores, {sa_s} Sales, {u_push_s} Users.\n'
-                f'Skipped (already in Frappe): {p_sk} Products, {c_sk} Customers, {s_sk} Stores, {sa_sk} Sales, {u_push_sk} Users.'
-            )
+            if (pull_s + u_pull_s + st_pull_s + stock_pull_res["synced"] + p_s + c_s + s_s + sa_s + u_push_s) == 0:
+                msg = (
+                    "Sync complete. Everything is already up to date!\n\n"
+                    f"(Skipped already synced: {pull_sk} Products, {sa_sk} Sales, {stock_pull_res['skipped']} Stock, etc.)"
+                )
+            else:
+                msg = (
+                    f'Pulled from Frappe: {pull_s} Products (skipped: {pull_sk}), {u_pull_s} Users (skipped: {u_pull_sk}), {st_pull_s} Stores (skipped: {st_pull_sk}), {stock_pull_res["synced"]} Stock Entries.\n'
+                    f'Pushed to Frappe: {p_s} Products, {c_s} Customers, {s_s} Stores, {sa_s} Sales, {u_push_s} Users.\n'
+                    f'Skipped (already in Frappe): {p_sk} Products, {c_sk} Customers, {s_sk} Stores, {sa_sk} Sales, {u_push_sk} Users.'
+                )
+            
             self._log(tenant, 'All Entities', 'success', f'Sync completed in {round(time.time() - start_time, 2)}s\n{msg}')
 
             return {
@@ -168,6 +178,19 @@ class FrappeSyncEngine(models.TransientModel):
         except Exception as e:
             self._log(tenant, doctype, 'error', f'Failed to fetch: {str(e)}')
             return []
+
+    def _frappe_get_single(self, tenant, doctype, docname):
+        url = f"{tenant.frappe_url.rstrip('/')}/api/resource/{urllib.parse.quote(doctype)}/{urllib.parse.quote(docname)}"
+        req = urllib.request.Request(url, headers={
+            'Authorization': f'token {tenant.frappe_api_key}:{tenant.frappe_api_secret}',
+            'Accept': 'application/json'
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=10) as response:
+                data = json.loads(response.read().decode())
+                return data.get('data', {})
+        except Exception as e:
+            return {}
 
     def _frappe_post(self, tenant, doctype, data, silent_409=False):
         """POST a new document to Frappe.
@@ -808,6 +831,92 @@ class FrappeSyncEngine(models.TransientModel):
                       f'Frappe → Odoo: {created} created, {updated} updated, {skipped} existing, {errors} errors', total)
         return {'synced': total, 'skipped': skipped}
 
+    def _pull_stock_from_frappe(self, tenant, start_time=None):
+        """Pull Frappe Bin quantities -> Odoo havanoposdesk.stock.valuation"""
+        bins = self._frappe_get(tenant, 'Bin', limit=5000)
+        if not bins:
+            return {'synced': 0, 'skipped': 0}
+
+        odoo_products = self.env['havanoposdesk.product'].sudo().search([('tenant_id', '=', tenant.id)])
+        code_to_product = {p.item_code or p.name: p for p in odoo_products}
+
+        odoo_variants = self.env['havanoposdesk.product.variant'].sudo().search([('tenant_id', '=', tenant.id)])
+        code_to_variant = {v.item_code or v.name: v for v in odoo_variants}
+
+        odoo_stores = self.env['havanoposdesk.store'].sudo().search([('tenant_id', '=', tenant.id)])
+        name_to_store = {s.name.lower(): s for s in odoo_stores}
+
+        updated = 0
+        skipped = 0
+        errors = 0
+
+        for b in bins:
+            if start_time and time.time() - start_time > 50:
+                self._log(tenant, 'Stock (pull)', 'skipped', 'Time limit reached. Yielding to prevent server restart.')
+                break
+
+            item_code = b.get('item_code')
+            warehouse = b.get('warehouse')
+            actual_qty = float(b.get('actual_qty') or 0.0)
+
+            if not warehouse or not item_code:
+                continue
+
+            store_name = warehouse.split(' - ')[0]
+            store = name_to_store.get(store_name.lower()) or name_to_store.get(warehouse.lower())
+
+            if not store:
+                continue
+
+            product = code_to_product.get(item_code)
+            variant = code_to_variant.get(item_code)
+
+            if not product and not variant:
+                continue
+                
+            domain = [
+                ('tenant_id', '=', tenant.id),
+                ('store_id', '=', store.id),
+            ]
+            
+            if variant:
+                domain.append(('variant_id', '=', variant.id))
+                p_id = variant.product_id.id
+            else:
+                p_id = product.id
+
+            domain.append(('product_id', '=', p_id))
+
+            try:
+                valuation = self.env['havanoposdesk.stock.valuation'].sudo().search(domain, limit=1)
+                if valuation:
+                    if abs(valuation.on_hand_qty - actual_qty) > 0.001:
+                        with self.env.cr.savepoint():
+                            valuation.write({'on_hand_qty': actual_qty})
+                        updated += 1
+                    else:
+                        skipped += 1
+                else:
+                    vals = {
+                        'tenant_id': tenant.id,
+                        'product_id': p_id,
+                        'store_id': store.id,
+                        'store': store.name,
+                        'on_hand_qty': actual_qty,
+                    }
+                    if variant:
+                        vals['variant_id'] = variant.id
+                    with self.env.cr.savepoint():
+                        self.env['havanoposdesk.stock.valuation'].sudo().create(vals)
+                    updated += 1
+            except Exception as e:
+                errors += 1
+                self._log(tenant, 'Stock (pull)', 'error', f'Failed to update stock for {item_code}: {str(e)}')
+
+        if updated > 0 or errors > 0:
+            self._log(tenant, 'Stock (pull)', 'success' if updated > 0 else 'error', f'Frappe → Odoo: {updated} updated, {skipped} existing, {errors} errors', updated)
+        return {'synced': updated, 'skipped': skipped}
+
     def _sync_stores(self, tenant, start_time=None):
         """Push Odoo stores TO Frappe as Warehouses."""
         frappe_warehouses = self._frappe_get(tenant, 'Warehouse', limit=200)
@@ -839,7 +948,74 @@ class FrappeSyncEngine(models.TransientModel):
 
     def _get_frappe_company(self, tenant):
         companies = self._frappe_get(tenant, 'Company', limit=5)
-        return companies[0].get('name') if companies else 'Your Company'
+        if not companies:
+            return 'Your Company'
+        
+        # Avoid picking Demo/Dummy company if a real one exists
+        for c in companies:
+            if 'Dummy' not in c.get('name', '') and 'Demo' not in c.get('name', ''):
+                return c.get('name')
+                
+        return companies[0].get('name')
+
+    def _get_or_create_frappe_batch(self, tenant, item_code):
+        """Return an existing Frappe batch for item_code, or create a new one.
+
+        This is called when an Odoo sale line has no batch_no recorded but
+        Frappe's item requires one (has_batch_no = 1).  We prefer to re-use
+        the most-recently created batch so stock stays consolidated; a new
+        batch is only created when none exists yet.
+        """
+        base_url = tenant.frappe_url.rstrip('/')
+        headers  = {
+            'Authorization': f'token {tenant.frappe_api_key}:{tenant.frappe_api_secret}',
+            'Accept': 'application/json',
+        }
+
+        # 1. Look for an existing batch for this item
+        filters = urllib.parse.quote(f'[["item","=","{item_code}"]]')
+        url = f'{base_url}/api/resource/Batch?limit_page_length=1&filters={filters}&order_by=creation+desc'
+        req = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=10) as res:
+                data = json.loads(res.read().decode())
+                batches = data.get('data', [])
+                if batches:
+                    return batches[0].get('name')
+        except Exception:
+            pass
+
+        # 2. No batch found — create one automatically
+        import datetime as _dt
+        batch_id = f'AUTO-{item_code}-{_dt.date.today().strftime("%Y%m%d")}'
+        batch_data = json.dumps({
+            'item': item_code,
+            'batch_id': batch_id,
+        }).encode()
+        post_req = urllib.request.Request(
+            f'{base_url}/api/resource/Batch',
+            data=batch_data,
+            headers={**headers, 'Content-Type': 'application/json'},
+            method='POST',
+        )
+        try:
+            with urllib.request.urlopen(post_req, timeout=10) as res:
+                result = json.loads(res.read().decode())
+                return result.get('data', {}).get('name') or batch_id
+        except urllib.error.HTTPError as e:
+            # 409 = batch already exists (race condition) — try fetching again
+            if e.code == 409:
+                try:
+                    with urllib.request.urlopen(req, timeout=10) as res:
+                        data = json.loads(res.read().decode())
+                        batches = data.get('data', [])
+                        if batches:
+                            return batches[0].get('name')
+                except Exception:
+                    pass
+            return batch_id   # fallback: return the ID we tried to create
+        except Exception:
+            return batch_id
 
     def _ensure_frappe_item_exists(self, tenant, item_code, item_name, item_group, stock_uom):
         """Ensure an item exists in Frappe, create if not."""
@@ -853,8 +1029,13 @@ class FrappeSyncEngine(models.TransientModel):
         try:
             with urllib.request.urlopen(req, timeout=10) as response:
                 return True  # Item exists
-        except:
-            pass
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                pass
+            else:
+                return False
+        except Exception:
+            return False
 
         # Create it
         item_data = {
@@ -868,24 +1049,37 @@ class FrappeSyncEngine(models.TransientModel):
         return bool(res and res.get('name'))
 
     def _ensure_frappe_warehouse_exists(self, tenant, store_name, wh_name_to_id):
-        """Ensure a warehouse exists in Frappe, create if not."""
+        """Ensure a warehouse exists in Frappe, create if not.
+
+        wh_name_to_id keys are *lowercased* so a simple dict lookup suffices.
+        We also strip any company suffix (e.g. " - GVS") from the Odoo store
+        name before looking up, so "Main Store" matches "Main Store - GVS".
+        """
         if not store_name:
             store_name = 'Main Store'
-            
-        # If it's already mapped, we have the Frappe ID
-        for wh_name, wh_id in wh_name_to_id.items():
-            if wh_name.lower() == store_name.lower():
+
+        store_lower = store_name.strip().lower()
+
+        # 1. Exact match (display name or full internal ID)
+        if store_lower in wh_name_to_id:
+            return wh_name_to_id[store_lower]
+
+        # 2. Partial match – Odoo store name is a prefix of a Frappe warehouse
+        #    e.g. "Main Store" matches "main store - gvs"
+        for wh_key, wh_id in wh_name_to_id.items():
+            if wh_key.startswith(store_lower) or store_lower.startswith(wh_key):
                 return wh_id
-                
-        # Create it in Frappe
+
+        # 3. Not found – create it in Frappe
         wh_data = {
             'warehouse_name': store_name,
             'company': self._get_frappe_company(tenant),
         }
         res = self._frappe_post(tenant, 'Warehouse', wh_data)
         if res and res.get('name'):
-            wh_name_to_id[store_name] = res.get('name')
-            return res.get('name')
+            new_id = res.get('name')
+            wh_name_to_id[store_lower] = new_id
+            return new_id
         return None
 
     def _ensure_frappe_customer_exists(self, tenant, customer_name):
@@ -898,8 +1092,13 @@ class FrappeSyncEngine(models.TransientModel):
         try:
             with urllib.request.urlopen(req, timeout=10) as response:
                 return True
-        except:
-            pass
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                pass
+            else:
+                return False
+        except Exception:
+            return False
 
         cust_group = self._get_frappe_customer_group(tenant)
         territory = self._get_frappe_territory(tenant)
@@ -918,8 +1117,21 @@ class FrappeSyncEngine(models.TransientModel):
         synced_sales = {inv.get('po_no'): True for inv in frappe_invoices if inv.get('po_no')}
 
         # Fetch Frappe warehouses to map to Odoo stores
+        company = self._get_frappe_company(tenant)
         frappe_whs = self._frappe_get(tenant, 'Warehouse', limit=500)
-        wh_name_to_id = {w.get('warehouse_name', w.get('name', '')): w.get('name') for w in frappe_whs}
+        # Build a mapping that covers BOTH the display name (warehouse_name)
+        # AND the full internal ID (e.g. "Main Store - GVS") so that an Odoo
+        # store named either way will resolve to the correct Frappe warehouse.
+        wh_name_to_id = {}
+        for w in frappe_whs:
+            if w.get('company') and w.get('company') != company:
+                continue
+            internal_id   = w.get('name', '')
+            display_name  = w.get('warehouse_name', internal_id)
+            if display_name:
+                wh_name_to_id[display_name.lower()] = internal_id
+            if internal_id and internal_id.lower() != display_name.lower():
+                wh_name_to_id[internal_id.lower()] = internal_id
 
         sales = self.env['havanoposdesk.sale'].search([
             ('tenant_id', '=', tenant.id),
@@ -929,6 +1141,7 @@ class FrappeSyncEngine(models.TransientModel):
         item_group = self._get_frappe_item_group(tenant)
         fallback_uom = self._get_frappe_uom(tenant)
 
+        frappe_item_batch_flags = {}
         count = 0
         skipped = 0
         for i, sale in enumerate(sales):
@@ -966,13 +1179,37 @@ class FrappeSyncEngine(models.TransientModel):
                 line_uom = self._get_frappe_uom(tenant, preferred_name=line_uom_name) if line_uom_name else fallback_uom
                 # Best-effort: create item in Frappe if missing
                 self._ensure_frappe_item_exists(tenant, code, name, item_group, line_uom)
-                items.append({
+                item_payload = {
                     'item_code': code,
                     'item_name': name,
                     'qty': line.accepted_qty or 1.0,
                     'rate': line.rate or 0.0,
                     'uom': line_uom,
-                })
+                }
+
+                # --- Serial / Batch number handling ---
+                odoo_serial = getattr(line, 'serial_no', None) or ''
+                odoo_batch  = getattr(line, 'batch_no',  None) or ''
+
+                if odoo_serial:
+                    item_payload['serial_no'] = odoo_serial
+
+                if odoo_batch:
+                    item_payload['batch_no'] = odoo_batch
+                else:
+                    # No batch recorded in Odoo — check if Frappe requires one.
+                    # Cache the flag per item_code to avoid repeated API calls.
+                    if code not in frappe_item_batch_flags:
+                        item_detail = self._frappe_get_single(tenant, 'Item', code)
+                        frappe_item_batch_flags[code] = bool(
+                            item_detail and item_detail.get('has_batch_no')
+                        )
+                    if frappe_item_batch_flags.get(code):
+                        auto_batch = self._get_or_create_frappe_batch(tenant, code)
+                        if auto_batch:
+                            item_payload['batch_no'] = auto_batch
+
+                items.append(item_payload)
 
             if not items:
                 continue
@@ -983,20 +1220,54 @@ class FrappeSyncEngine(models.TransientModel):
             store_name = sale.store or (sale.store_id.name if sale.store_id else '')
             frappe_wh_id = self._ensure_frappe_warehouse_exists(tenant, store_name, wh_name_to_id)
 
+            # Map Odoo payment_status → Frappe Mode of Payment
+            # Odoo stores payment_status as the payment method name (e.g. 'cash', 'card', 'CBZ USD')
+            odoo_payment = (getattr(sale, 'payment_status', '') or '').strip()
+            amount_paid  = float(getattr(sale, 'amount_paid_base', 0) or 0)
+            amount_total = float(getattr(sale, 'amount_total_base', 0) or 0)
+            is_paid = amount_paid >= amount_total > 0
+
+            # Map common Odoo payment names to Frappe Mode of Payment names
+            payment_mode_map = {
+                'cash':  'Cash',
+                'card':  'Cash',   # fallback – adjust if you have a Card MOP in Frappe
+                'zwg':   'ZWG',
+            }
+            frappe_mop = payment_mode_map.get(odoo_payment.lower(), odoo_payment or 'Cash')
+
             data = {
                 'customer': customer_name,
+                'company': company,
                 'po_no': sale.name,
                 'items': items,
                 'update_stock': 1,
                 'posting_date': str(sale.posting_date) if sale.posting_date else str(fields.Date.today()),
-                'docstatus': 0, # Draft instead of Submit to avoid stock validation blocking sync
+                'docstatus': 1, # Submit to sync stock properly
             }
+
+            # Mark invoice as POS / paid if the sale was fully paid in Odoo
+            if is_paid:
+                data['is_pos'] = 1
+                data['payments'] = [{
+                    'mode_of_payment': frappe_mop,
+                    'amount': amount_paid,
+                }]
+
             if frappe_wh_id:
                 data['set_warehouse'] = frappe_wh_id
 
+
             res = self._frappe_post(tenant, 'Sales Invoice', data)
             if res and res.get('name'):
-                self._log(tenant, f'Sale: {sale.name}', 'success', f'Pushed as {res.get("name")}', 1)
+                doc_name = res.get('name')
+                
+                # Submit the document
+                try:
+                    submit_res = self._frappe_put(tenant, 'Sales Invoice', doc_name, {'docstatus': 1})
+                    self._log(tenant, f'Sale: {sale.name}', 'success', f'Pushed and submitted as {doc_name}', 1)
+                except Exception as e:
+                    self._log(tenant, f'Sale: {sale.name}', 'error', f'Pushed as {doc_name} but failed to submit: {str(e)}')
+                
                 count += 1
             else:
                 self._log(tenant, f'Sale: {sale.name}', 'error', 'Failed to push to Frappe')

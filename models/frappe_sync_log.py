@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
-from odoo import models, fields
-
+from odoo import models, fields, api
 class FrappeSyncLog(models.Model):
     _name = 'frappe.sync.log'
     _description = 'Frappe Sync Log'
@@ -15,3 +14,9 @@ class FrappeSyncLog(models.Model):
     ], string='Status')
     details = fields.Text('Details')
     records_synced = fields.Integer('Records Synced', default=0)
+
+    @api.model
+    def autovacuum_logs(self, days_to_keep=7):
+        date_limit = fields.Datetime.subtract(fields.Datetime.now(), days=days_to_keep)
+        logs_to_delete = self.search([('create_date', '<', date_limit)])
+        logs_to_delete.unlink()
