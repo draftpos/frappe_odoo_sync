@@ -758,14 +758,14 @@ class FrappeSyncEngine(models.TransientModel):
                 # Include known mandatory custom fields with safe defaults
                 'custom_telephone_number': customer.phone or '0000000000',
                 'custom_email_address': customer.email or f'{name.replace(" ", ".").lower()}@noemail.com',
-                'custom_customer_tin': '',
-                'custom_customer_vat': '',
-                'custom_trade_name': name,
-                'custom_customer_address': '',
-                'custom_street': '',
-                'custom_house_no': '',
-                'custom_city': '',
-                'custom_province': '',
+                'custom_customer_tin': 'N/A',
+                'custom_customer_vat': 'N/A',
+                'custom_trade_name': name or 'N/A',
+                'custom_customer_address': 'N/A',
+                'custom_street': 'N/A',
+                'custom_house_no': 'N/A',
+                'custom_city': 'N/A',
+                'custom_province': 'N/A',
             }
             res = self._frappe_post(tenant, 'Customer', cust_data)
             if res and res.get('name'):
@@ -1082,23 +1082,13 @@ class FrappeSyncEngine(models.TransientModel):
             return new_id
         return None
 
-    def _ensure_frappe_customer_exists(self, tenant, customer_name):
-        customers = self._frappe_get(tenant, 'Customer', limit=1)
-        url = f"{tenant.frappe_url.rstrip('/')}/api/resource/Customer/{urllib.parse.quote(customer_name)}"
-        req = urllib.request.Request(url, headers={
-            'Authorization': f'token {tenant.frappe_api_key}:{tenant.frappe_api_secret}',
-            'Accept': 'application/json'
-        })
-        try:
-            with urllib.request.urlopen(req, timeout=10) as response:
-                return True
-        except urllib.error.HTTPError as e:
-            if e.code == 404:
-                pass
-            else:
-                return False
-        except Exception:
-            return False
+    def _ensure_frappe_customer_exists(self, tenant, customer_name, cust_name_to_id):
+        if not customer_name:
+            customer_name = 'CASH'
+        
+        cust_lower = customer_name.strip().lower()
+        if cust_lower in cust_name_to_id:
+            return cust_name_to_id[cust_lower]
 
         cust_group = self._get_frappe_customer_group(tenant)
         territory = self._get_frappe_territory(tenant)
@@ -1107,9 +1097,23 @@ class FrappeSyncEngine(models.TransientModel):
             'customer_type': 'Individual',
             'customer_group': cust_group,
             'territory': territory,
+            'custom_telephone_number': '0000000000',
+            'custom_email_address': f'{customer_name.replace(" ", ".").lower()}@noemail.com',
+            'custom_customer_tin': 'N/A',
+            'custom_customer_vat': 'N/A',
+            'custom_trade_name': customer_name or 'N/A',
+            'custom_customer_address': 'N/A',
+            'custom_street': 'N/A',
+            'custom_house_no': 'N/A',
+            'custom_city': 'N/A',
+            'custom_province': 'N/A',
         }
         res = self._frappe_post(tenant, 'Customer', cust_data)
-        return bool(res and res.get('name'))
+        if res and res.get('name'):
+            new_id = res.get('name')
+            cust_name_to_id[cust_lower] = new_id
+            return new_id
+        return None
 
     def _sync_sales(self, tenant, start_time=None):
         """Push Odoo sales to Frappe as Sales Invoices."""
@@ -1132,6 +1136,17 @@ class FrappeSyncEngine(models.TransientModel):
                 wh_name_to_id[display_name.lower()] = internal_id
             if internal_id and internal_id.lower() != display_name.lower():
                 wh_name_to_id[internal_id.lower()] = internal_id
+
+        # Fetch Frappe customers to map Odoo customer names to Frappe IDs
+        frappe_custs = self._frappe_get(tenant, 'Customer', limit=2000)
+        cust_name_to_id = {}
+        for c in frappe_custs:
+            internal_id = c.get('name', '')
+            display_name = c.get('customer_name', internal_id)
+            if display_name:
+                cust_name_to_id[display_name.lower()] = internal_id
+            if internal_id and internal_id.lower() != display_name.lower():
+                cust_name_to_id[internal_id.lower()] = internal_id
 
         sales = self.env['havanoposdesk.sale'].search([
             ('tenant_id', '=', tenant.id),
@@ -1215,8 +1230,12 @@ class FrappeSyncEngine(models.TransientModel):
                 continue
 
             customer_name = sale.customer.name if sale.customer else 'CASH'
-            self._ensure_frappe_customer_exists(tenant, customer_name)
+            frappe_customer_id = self._ensure_frappe_customer_exists(tenant, customer_name, cust_name_to_id)
             
+            if not frappe_customer_id:
+                self._log(tenant, f'Sale: {sale.name}', 'error', f"Skipped: Could not map or create customer '{customer_name}' in Frappe.")
+                continue
+
             store_name = sale.store or (sale.store_id.name if sale.store_id else '')
             frappe_wh_id = self._ensure_frappe_warehouse_exists(tenant, store_name, wh_name_to_id)
 
@@ -1236,7 +1255,7 @@ class FrappeSyncEngine(models.TransientModel):
             frappe_mop = payment_mode_map.get(odoo_payment.lower(), odoo_payment or 'Cash')
 
             data = {
-                'customer': customer_name,
+                'customer': frappe_customer_id,
                 'company': company,
                 'po_no': sale.name,
                 'items': items,
