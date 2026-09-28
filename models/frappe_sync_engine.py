@@ -1232,6 +1232,16 @@ class FrappeSyncEngine(models.TransientModel):
             customer_name = sale.customer.name if sale.customer else 'CASH'
             frappe_customer_id = self._ensure_frappe_customer_exists(tenant, customer_name, cust_name_to_id)
             
+            if frappe_customer_id:
+                # Verify the customer actually exists to prevent 'NoneType' object has no attribute 'payment_terms'
+                # in case the customer was deleted from Frappe but remained in the list cache.
+                verify_doc = self._frappe_get_single(tenant, 'Customer', frappe_customer_id)
+                if not verify_doc:
+                    cust_lower = customer_name.strip().lower()
+                    if cust_lower in cust_name_to_id:
+                        del cust_name_to_id[cust_lower]
+                    frappe_customer_id = self._ensure_frappe_customer_exists(tenant, customer_name, cust_name_to_id)
+
             if not frappe_customer_id:
                 self._log(tenant, f'Sale: {sale.name}', 'error', f"Skipped: Could not map or create customer '{customer_name}' in Frappe.")
                 continue
@@ -1261,6 +1271,7 @@ class FrappeSyncEngine(models.TransientModel):
                 'items': items,
                 'update_stock': 1,
                 'posting_date': str(sale.posting_date) if sale.posting_date else str(fields.Date.today()),
+                'due_date': str(sale.posting_date) if sale.posting_date else str(fields.Date.today()),
                 'docstatus': 1, # Submit to sync stock properly
             }
 
