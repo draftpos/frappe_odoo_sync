@@ -20,7 +20,7 @@
                     <button string="Revert Non-Sales Products" type="object" name="action_revert_non_sales_items" class="btn-warning" icon="fa-eraser" confirm="This will deactivate all synced products in Odoo that do not have 'Allow Sales' checked in Frappe. Continue?"/>
                     
                     <field name="frappe_sync_log_ids" readonly="1" class="mt-4">
-                        <list string="Sync Logs" default_order="create_date desc" decoration-success="status == 'success'" decoration-danger="status == 'error'" decoration-info="status == 'skipped'">
+                        <list string="Sync Logs" limit="50" default_order="create_date desc" decoration-success="status == 'success'" decoration-danger="status == 'error'" decoration-info="status == 'skipped'">
                             <field name="create_date" string="Created on"/>
                             <field name="entity"/>
                             <field name="status" widget="badge"
@@ -36,10 +36,44 @@
         </field>
     </record>
 
+
+    <record id="view_frappe_sync_log_search" model="ir.ui.view">
+        <field name="name">frappe.sync.log.search</field>
+        <field name="model">frappe.sync.log</field>
+        <field name="arch" type="xml">
+            <search>
+                <field name="entity"/>
+                <field name="status"/>
+                <field name="details"/>
+
+                <filter string="Sales" name="filter_sales" domain="[('entity', 'ilike', 'Sale')]"/>
+                <filter string="Quantity / Stock" name="filter_quantity" domain="[('entity', 'ilike', 'Stock')]"/>
+                <filter string="Products" name="filter_products" domain="[('entity', 'ilike', 'Product')]"/>
+                <filter string="Customers" name="filter_customers" domain="[('entity', 'ilike', 'Customer')]"/>
+                <separator/>
+                <filter string="Success" name="filter_success" domain="[('status', '=', 'success')]"/>
+                <filter string="Error" name="filter_error" domain="[('status', '=', 'error')]"/>
+                <filter string="Skipped" name="filter_skipped" domain="[('status', '=', 'skipped')]"/>
+                <separator/>
+                <filter string="Today" name="filter_today" domain="[('create_date', '&gt;=', context_today().strftime('%Y-%m-%d'))]"/>
+                <filter string="Yesterday" name="filter_yesterday" domain="[('create_date', '&gt;=', (context_today() - datetime.timedelta(days=1)).strftime('%Y-%m-%d')), ('create_date', '&lt;', context_today().strftime('%Y-%m-%d'))]"/>
+
+                <group>
+                    <filter string="Group By Status" name="group_status" context="{'group_by': 'status'}"/>
+                    <filter string="Group By Entity" name="group_entity" context="{'group_by': 'entity'}"/>
+                    <filter string="Group By Date" name="group_date" context="{'group_by': 'create_date:day'}"/>
+                </group>
+            </search>
+        </field>
+    </record>
+
+
+
     <record id="action_frappe_sync_log" model="ir.actions.act_window">
         <field name="name">Frappe Sync Logs</field>
         <field name="res_model">frappe.sync.log</field>
         <field name="view_mode">list,form</field>
+        <field name="search_view_id" ref="view_frappe_sync_log_search"/>
     </record>
 
     <record id="view_frappe_sync_log_tree" model="ir.ui.view">
