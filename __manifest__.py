@@ -4,6 +4,7 @@
     'version': '1.0.0',
     'category': 'Accounting/Payment Providers',
     'summary': 'Paynow and EcoCash Payment Gateway Integration',
+    'author': 'Havano',
     'description': """
         This module integrates Paynow and EcoCash payment solutions into Odoo.
     """,
