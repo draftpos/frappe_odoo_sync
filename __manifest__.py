@@ -35,4 +35,5 @@ Auto-syncs every minute via scheduled action.
     'application': False,
     'auto_install': False,
     'license': 'LGPL-3',
+    'uninstall_hook': 'uninstall_hook',
 }

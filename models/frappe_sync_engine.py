@@ -94,8 +94,16 @@ class FrappeSyncEngine(models.TransientModel):
                     f'Pushed to Frappe: {p_s} Products, {c_s} Customers, {s_s} Stores, {sa_s} Sales, {u_push_s} Users.\n'
                     f'Skipped (already in Frappe): {p_sk} Products, {c_sk} Customers, {s_sk} Stores, {sa_sk} Sales, {u_push_sk} Users.'
                 )
-            
-            self._log(tenant, 'All Entities', 'success', f'Sync completed in {round(time.time() - start_time, 2)}s\n{msg}')
+            # If the sync took a long time, it likely hit a limit and has more work to do.
+            # Trigger the background cron to pick up the next batch immediately.
+            elapsed = time.time() - start_time
+            if elapsed > 40:
+                cron = self.env.ref('frappe_odoo_sync.ir_cron_frappe_sync', raise_if_not_found=False)
+                if cron:
+                    cron._trigger()
+                    msg += "\n\n(There is more data to sync. The background worker has been triggered to continue immediately.)"
+
+            self._log(tenant, 'All Entities', 'success', f'Sync completed in {round(elapsed, 2)}s\n{msg}')
 
             return {
                 'type': 'ir.actions.client',
@@ -1150,8 +1158,9 @@ class FrappeSyncEngine(models.TransientModel):
 
         sales = self.env['havanoposdesk.sale'].search([
             ('tenant_id', '=', tenant.id),
-            ('state', 'in', ['done', 'confirmed'])
-        ], limit=50, order='id asc')
+            ('state', 'in', ['done', 'confirmed']),
+            ('frappe_synced', '=', False)
+        ], limit=200, order='id asc')
 
         item_group = self._get_frappe_item_group(tenant)
         fallback_uom = self._get_frappe_uom(tenant)
@@ -1170,6 +1179,7 @@ class FrappeSyncEngine(models.TransientModel):
                 except Exception:
                     pass
             if sale.name in synced_sales:
+                sale.sudo().write({'frappe_synced': True})
                 skipped += 1
                 continue
             
@@ -1180,6 +1190,7 @@ class FrappeSyncEngine(models.TransientModel):
             ], limit=1)
 
             if existing_log:
+                sale.sudo().write({'frappe_synced': True})
                 skipped += 1
                 continue
 
@@ -1298,6 +1309,7 @@ class FrappeSyncEngine(models.TransientModel):
                 except Exception as e:
                     self._log(tenant, f'Sale: {sale.name}', 'error', f'Pushed as {doc_name} but failed to submit: {str(e)}')
                 
+                sale.sudo().write({'frappe_synced': True})
                 count += 1
             else:
                 self._log(tenant, f'Sale: {sale.name}', 'error', 'Failed to push to Frappe')
