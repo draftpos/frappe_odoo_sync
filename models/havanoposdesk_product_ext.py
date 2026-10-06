@@ -12,6 +12,15 @@ class HavanoposdeskProductExt(models.Model):
         default=False,
     )
 
+    @api.depends('is_variant')
+    def _compute_has_variants(self):
+        for record in self:
+            record.has_variants = getattr(record, 'is_variant', False)
+
+    def _search_has_variants(self, operator, value):
+        return [('is_variant', operator, value)]
+
+
     def _set_has_variants_ext(self):
         for record in self:
             if record.is_variant != record.has_variants:
