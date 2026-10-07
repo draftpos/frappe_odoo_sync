@@ -3,6 +3,7 @@
     'name': 'Frappe / ERPNext Sync Bridge',
     'version': '19.0.2.0',
     'category': 'Technical',
+    'author': 'Havano',
     'summary': 'Full bidirectional sync between Havano POS Desk and Frappe/ERPNext',
     'description': """
 Frappe / ERPNext Sync Bridge for Havano POS Desk.
