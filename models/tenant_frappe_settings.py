@@ -17,6 +17,12 @@ class TenantFrappeSettings(models.Model):
     frappe_api_key = fields.Char(string='Frappe API Key')
     frappe_api_secret = fields.Char(string='Frappe API Secret')
     frappe_sync_log_ids = fields.One2many('frappe.sync.log', 'tenant_id', string='Sync Logs')
+    store_count = fields.Integer(string='Stores Count', compute='_compute_store_count')
+
+    def _compute_store_count(self):
+        for rec in self:
+            rec.store_count = self.env['havanoposdesk.store'].search_count([('tenant_id', '=', rec.id)])
+
 
     def action_test_frappe_connection(self):
         self.ensure_one()
