@@ -79,8 +79,8 @@ class ResUsers(models.Model):
     _inherit = 'res.users'
 
     category_ids = fields.Many2many(
-        related='partner_id.category_ids',
-        string='Tags',
-        readonly=False
+        'res.partner.category',
+        string='Tags'
     )
+
 
