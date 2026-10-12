@@ -1194,6 +1194,10 @@ class FrappeSyncEngine(models.TransientModel):
                 skipped += 1
                 continue
 
+            # 1. Resolve Store / Warehouse for the sale first so items can reference it
+            store_name = (sale.store_id.name if sale.store_id else '') or sale.store or ''
+            frappe_wh_id = self._ensure_frappe_warehouse_exists(tenant, store_name, wh_name_to_id)
+
             # Build items list - ensure each item exists in Frappe first
             items = []
             for line in sale.line_ids:
@@ -1205,6 +1209,11 @@ class FrappeSyncEngine(models.TransientModel):
                 line_uom = self._get_frappe_uom(tenant, preferred_name=line_uom_name) if line_uom_name else fallback_uom
                 # Best-effort: create item in Frappe if missing
                 self._ensure_frappe_item_exists(tenant, code, name, item_group, line_uom)
+
+                # Resolve warehouse for this specific line (fallback to sale's store warehouse)
+                line_store = (line.store_id.name if getattr(line, 'store_id', None) else '') or store_name
+                line_wh = self._ensure_frappe_warehouse_exists(tenant, line_store, wh_name_to_id) if line_store else frappe_wh_id
+
                 item_payload = {
                     'item_code': code,
                     'item_name': name,
@@ -1212,6 +1221,8 @@ class FrappeSyncEngine(models.TransientModel):
                     'rate': line.rate or 0.0,
                     'uom': line_uom,
                 }
+                if line_wh:
+                    item_payload['warehouse'] = line_wh
 
                 # --- Serial / Batch number handling ---
                 odoo_serial = getattr(line, 'serial_no', None) or ''
@@ -1257,9 +1268,6 @@ class FrappeSyncEngine(models.TransientModel):
                 self._log(tenant, f'Sale: {sale.name}', 'error', f"Skipped: Could not map or create customer '{customer_name}' in Frappe.")
                 continue
 
-            store_name = sale.store or (sale.store_id.name if sale.store_id else '')
-            frappe_wh_id = self._ensure_frappe_warehouse_exists(tenant, store_name, wh_name_to_id)
-
             # Map Odoo payment_status → Frappe Mode of Payment
             # Odoo stores payment_status as the payment method name (e.g. 'cash', 'card', 'CBZ USD')
             odoo_payment = (getattr(sale, 'payment_status', '') or '').strip()
@@ -1283,8 +1291,15 @@ class FrappeSyncEngine(models.TransientModel):
                 'update_stock': 1,
                 'posting_date': str(sale.posting_date) if sale.posting_date else str(fields.Date.today()),
                 'due_date': str(sale.posting_date) if sale.posting_date else str(fields.Date.today()),
-                'docstatus': 1, # Submit to sync stock properly
             }
+
+            # Set warehouse at document level and remarks for clear visibility
+            if frappe_wh_id:
+                data['set_warehouse'] = frappe_wh_id
+
+            store_label = store_name or (frappe_wh_id.split(' - ')[0] if frappe_wh_id else '')
+            if store_label:
+                data['remarks'] = f"Store: {store_label} | Sale: {sale.name}"
 
             # Mark invoice as POS / paid if the sale was fully paid in Odoo
             if is_paid:
@@ -1294,20 +1309,40 @@ class FrappeSyncEngine(models.TransientModel):
                     'amount': amount_paid,
                 }]
 
-            if frappe_wh_id:
-                data['set_warehouse'] = frappe_wh_id
-
-
             res = self._frappe_post(tenant, 'Sales Invoice', data)
             if res and res.get('name'):
                 doc_name = res.get('name')
                 
-                # Submit the document
-                try:
-                    submit_res = self._frappe_put(tenant, 'Sales Invoice', doc_name, {'docstatus': 1})
+                # Submit the document via Frappe RPC method
+                submit_success = False
+                submit_err = None
+                
+                # Attempt 1: run_doc_method
+                sub_res = self._frappe_method_post(tenant, 'run_doc_method', {
+                    'dt': 'Sales Invoice',
+                    'dn': doc_name,
+                    'method': 'submit',
+                })
+                if isinstance(sub_res, dict) and not sub_res.get('error'):
+                    submit_success = True
+                else:
+                    submit_err = sub_res.get('error') if isinstance(sub_res, dict) else str(sub_res)
+                    # Attempt 2: frappe.client.submit
+                    doc_dict = self._frappe_get_single(tenant, 'Sales Invoice', doc_name)
+                    if doc_dict:
+                        sub_res2 = self._frappe_method_post(tenant, 'frappe.client.submit', {
+                            'doc': json.dumps(doc_dict)
+                        })
+                        if isinstance(sub_res2, dict) and not sub_res2.get('error'):
+                            submit_success = True
+                            submit_err = None
+                        elif isinstance(sub_res2, dict) and sub_res2.get('error'):
+                            submit_err = sub_res2.get('error')
+
+                if submit_success:
                     self._log(tenant, f'Sale: {sale.name}', 'success', f'Pushed and submitted as {doc_name}', 1)
-                except Exception as e:
-                    self._log(tenant, f'Sale: {sale.name}', 'error', f'Pushed as {doc_name} but failed to submit: {str(e)}')
+                else:
+                    self._log(tenant, f'Sale: {sale.name}', 'warning', f'Pushed as draft {doc_name}. Submit note: {submit_err or "Draft"}', 1)
                 
                 sale.sudo().write({'frappe_synced': True})
                 count += 1
