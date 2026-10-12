@@ -1,4 +1,4 @@
-from odoo import models, api
+from odoo import models, fields, api
 
 def trigger_sync(env):
     cron = env.ref('frappe_odoo_sync.ir_cron_frappe_sync', raise_if_not_found=False)
@@ -74,3 +74,13 @@ class HavanoposdeskSale(models.Model):
         res = super().write(vals)
         trigger_sync(self.env)
         return res
+
+class ResUsers(models.Model):
+    _inherit = 'res.users'
+
+    category_ids = fields.Many2many(
+        related='partner_id.category_ids',
+        string='Tags',
+        readonly=False
+    )
+
