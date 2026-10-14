@@ -78,9 +78,15 @@ class HavanoposdeskSale(models.Model):
 class ResUsers(models.Model):
     _inherit = 'res.users'
 
-    category_ids = fields.Many2many(
-        'res.partner.category',
-        string='Tags'
-    )
+    @api.model_create_multi
+    def create(self, vals_list):
+        res = super().create(vals_list)
+        trigger_sync(self.env)
+        return res
+
+    def write(self, vals):
+        res = super().write(vals)
+        trigger_sync(self.env)
+        return res
 
 
