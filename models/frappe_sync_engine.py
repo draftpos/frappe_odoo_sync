@@ -681,6 +681,7 @@ class FrappeSyncEngine(models.TransientModel):
                     'standard_rate': selling_price,
                     'valuation_rate': buying_price,
                     'is_stock_item': 1 if track_qty else 0,
+                    'is_sales_item': 1,
                     'description': notes or name,
                     'has_variants': 1 if has_variants else 0,
                     'disabled': 1 if not is_active else 0,
@@ -1052,6 +1053,7 @@ class FrappeSyncEngine(models.TransientModel):
             'item_group': item_group,
             'stock_uom': stock_uom,
             'is_stock_item': 0,
+            'is_sales_item': 1,
         }
         res = self._frappe_post(tenant, 'Item', item_data)
         return bool(res and res.get('name'))
@@ -1309,35 +1311,49 @@ class FrappeSyncEngine(models.TransientModel):
                     'amount': amount_paid,
                 }]
 
+            # Send invoice as submitted (docstatus=1)
+            data['docstatus'] = 1
+
             res = self._frappe_post(tenant, 'Sales Invoice', data)
+            if not res or not res.get('name'):
+                # Fallback if Frappe rejects direct insert with docstatus=1: create as draft then submit
+                data['docstatus'] = 0
+                res = self._frappe_post(tenant, 'Sales Invoice', data)
+
             if res and res.get('name'):
                 doc_name = res.get('name')
+                is_already_submitted = (res.get('docstatus') == 1)
                 
-                # Submit the document via Frappe RPC method
-                submit_success = False
+                submit_success = is_already_submitted
                 submit_err = None
                 
-                # Attempt 1: run_doc_method
-                sub_res = self._frappe_method_post(tenant, 'run_doc_method', {
-                    'dt': 'Sales Invoice',
-                    'dn': doc_name,
-                    'method': 'submit',
-                })
-                if isinstance(sub_res, dict) and not sub_res.get('error'):
-                    submit_success = True
-                else:
-                    submit_err = sub_res.get('error') if isinstance(sub_res, dict) else str(sub_res)
-                    # Attempt 2: frappe.client.submit
-                    doc_dict = self._frappe_get_single(tenant, 'Sales Invoice', doc_name)
-                    if doc_dict:
-                        sub_res2 = self._frappe_method_post(tenant, 'frappe.client.submit', {
-                            'doc': json.dumps(doc_dict)
+                if not submit_success:
+                    # Attempt 1: PUT docstatus = 1
+                    put_res = self._frappe_put(tenant, 'Sales Invoice', doc_name, {'docstatus': 1})
+                    if put_res and put_res.get('docstatus') == 1:
+                        submit_success = True
+                    else:
+                        # Attempt 2: run_doc_method submit
+                        sub_res = self._frappe_method_post(tenant, 'run_doc_method', {
+                            'dt': 'Sales Invoice',
+                            'dn': doc_name,
+                            'method': 'submit',
                         })
-                        if isinstance(sub_res2, dict) and not sub_res2.get('error'):
+                        if isinstance(sub_res, dict) and not sub_res.get('error'):
                             submit_success = True
-                            submit_err = None
-                        elif isinstance(sub_res2, dict) and sub_res2.get('error'):
-                            submit_err = sub_res2.get('error')
+                        else:
+                            submit_err = sub_res.get('error') if isinstance(sub_res, dict) else str(sub_res)
+                            # Attempt 3: frappe.client.submit
+                            doc_dict = self._frappe_get_single(tenant, 'Sales Invoice', doc_name)
+                            if doc_dict:
+                                sub_res2 = self._frappe_method_post(tenant, 'frappe.client.submit', {
+                                    'doc': json.dumps(doc_dict)
+                                })
+                                if isinstance(sub_res2, dict) and not sub_res2.get('error'):
+                                    submit_success = True
+                                    submit_err = None
+                                elif isinstance(sub_res2, dict) and sub_res2.get('error'):
+                                    submit_err = sub_res2.get('error')
 
                 if submit_success:
                     self._log(tenant, f'Sale: {sale.name}', 'success', f'Pushed and submitted as {doc_name}', 1)
