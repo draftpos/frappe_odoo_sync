@@ -52,26 +52,49 @@ class FrappeSyncEngine(models.TransientModel):
         start_time = time.time()
         try:
             # 1. Sync UOMs first so Frappe has them before products/sales reference them
+            t0 = time.time()
             self._sync_uoms(tenant, start_time=start_time)
 
             # 2. Pull Frappe Items → Odoo (bidirectional product sync)
+            t0 = time.time()
             pull_res = self._pull_products_from_frappe(tenant, start_time=start_time)
+            pull_dur = time.time() - t0
             
             # 3. Pull Frappe Users → Odoo
+            t0 = time.time()
             u_pull_res = self._pull_users_from_frappe(tenant, start_time=start_time)
+            u_pull_dur = time.time() - t0
 
             # 4. Pull Frappe Warehouses → Odoo Stores
+            t0 = time.time()
             st_pull_res = self._pull_stores_from_frappe(tenant, start_time=start_time)
+            st_pull_dur = time.time() - t0
 
             # 4.5. Pull Frappe Stock → Odoo Stock Valuations
+            t0 = time.time()
             stock_pull_res = self._pull_stock_from_frappe(tenant, start_time=start_time)
+            stock_pull_dur = time.time() - t0
 
             # 5. Push Odoo data → Frappe
+            t0 = time.time()
             p_res = self._sync_products(tenant, start_time=start_time)
+            p_push_dur = time.time() - t0
+
+            t0 = time.time()
             c_res = self._sync_customers(tenant, start_time=start_time)
+            c_push_dur = time.time() - t0
+
+            t0 = time.time()
             s_res = self._sync_stores(tenant, start_time=start_time)
+            s_push_dur = time.time() - t0
+
+            t0 = time.time()
             sa_res = self._sync_sales(tenant, start_time=start_time)
+            sa_push_dur = time.time() - t0
+
+            t0 = time.time()
             u_push_res = self._sync_users(tenant, start_time=start_time)
+            u_push_dur = time.time() - t0
 
             pull_s, pull_sk = pull_res['synced'], pull_res['skipped']
             u_pull_s, u_pull_sk = u_pull_res['synced'], u_pull_res['skipped']
@@ -90,8 +113,8 @@ class FrappeSyncEngine(models.TransientModel):
                 )
             else:
                 msg = (
-                    f'Pulled from Frappe: {pull_s} Products (skipped: {pull_sk}), {u_pull_s} Users (skipped: {u_pull_sk}), {st_pull_s} Stores (skipped: {st_pull_sk}), {stock_pull_res["synced"]} Stock Entries.\n'
-                    f'Pushed to Frappe: {p_s} Products, {c_s} Customers, {s_s} Stores, {sa_s} Sales, {u_push_s} Users.\n'
+                    f'Pulled from Frappe: {pull_s} Products ({round(pull_dur, 2)}s), {u_pull_s} Users ({round(u_pull_dur, 2)}s), {st_pull_s} Stores ({round(st_pull_dur, 2)}s), {stock_pull_res["synced"]} Stock Entries ({round(stock_pull_dur, 2)}s).\n'
+                    f'Pushed to Frappe: {p_s} Products ({round(p_push_dur, 2)}s), {c_s} Customers ({round(c_push_dur, 2)}s), {s_s} Stores ({round(s_push_dur, 2)}s), {sa_s} Sales ({round(sa_push_dur, 2)}s), {u_push_s} Users ({round(u_push_dur, 2)}s).\n'
                     f'Skipped (already in Frappe): {p_sk} Products, {c_sk} Customers, {s_sk} Stores, {sa_sk} Sales, {u_push_sk} Users.'
                 )
             # If the sync took a long time, it likely hit a limit and has more work to do.
@@ -103,7 +126,19 @@ class FrappeSyncEngine(models.TransientModel):
                     cron._trigger()
                     msg += "\n\n(There is more data to sync. The background worker has been triggered to continue immediately.)"
 
-            self._log(tenant, 'All Entities', 'success', f'Sync completed in {round(elapsed, 2)}s\n{msg}')
+            # Update last sync timestamps so subsequent checks only query delta changes
+            tenant.sudo().write({
+                'frappe_last_pull_datetime': fields.Datetime.now(),
+                'frappe_last_push_datetime': fields.Datetime.now(),
+            })
+
+            self._log(tenant, 'All Entities', 'success', f'Sync completed in {round(elapsed, 2)}s\n{msg}', duration=elapsed)
+
+            # Reclaim RAM and cache space after sync completes
+            try:
+                self.env['frappe.sync.log'].optimize_memory_and_space()
+            except Exception:
+                pass
 
             return {
                 'type': 'ir.actions.client',
@@ -169,8 +204,10 @@ class FrappeSyncEngine(models.TransientModel):
             self._log(tenant, 'Revert', 'error', str(e))
             raise exceptions.UserError(f'Revert failed: {str(e)}')
 
-    def _frappe_get(self, tenant, doctype, limit=500):
+    def _frappe_get(self, tenant, doctype, limit=500, filters=None):
         url = f"{tenant.frappe_url.rstrip('/')}/api/resource/{urllib.parse.quote(doctype)}?limit_page_length={limit}&fields=[\"*\"]"
+        if filters:
+            url += f"&filters={urllib.parse.quote(json.dumps(filters))}"
         req = urllib.request.Request(url, headers={
             'Authorization': f'token {tenant.frappe_api_key}:{tenant.frappe_api_secret}',
             'Accept': 'application/json'
@@ -279,20 +316,58 @@ class FrappeSyncEngine(models.TransientModel):
         except Exception as e:
             return {'error': str(e)}
 
-    def _log(self, tenant, entity, status, details='', records=0):
+    def _get_entity_table_size_kb(self, entity):
+        """Query PostgreSQL for total relation size in KB for the entity's underlying table."""
+        table_map = {
+            'Item': 'havanoposdesk_product',
+            'Product': 'havanoposdesk_product',
+            'Stock': 'havanoposdesk_stock_valuation',
+            'Sale': 'havanoposdesk_sale',
+            'Sales': 'havanoposdesk_sale',
+            'Customer': 'havanoposdesk_customer',
+            'Warehouse': 'havanoposdesk_store',
+            'Store': 'havanoposdesk_store',
+            'User': 'res_users',
+            'UOM': 'havanoposdesk_uom',
+        }
+        target_table = None
+        for key, tbl in table_map.items():
+            if key.lower() in (entity or '').lower():
+                target_table = tbl
+                break
+
+        if not target_table:
+            return 0.0
+
+        try:
+            self.env.cr.execute(
+                "SELECT pg_total_relation_size(%s::regclass)::float / 1024.0;",
+                (target_table,)
+            )
+            res = self.env.cr.fetchone()
+            return round(res[0], 2) if res and res[0] else 0.0
+        except Exception:
+            return 0.0
+
+    def _log(self, tenant, entity, status, details='', records=0, duration=0.0, payload_kb=0.0):
         """Write a sync log entry inside its own savepoint.
 
         Using a savepoint ensures that a failed log write (e.g. cursor in an
         aborted transaction) never rolls back work already done by the caller.
+        Tracks execution duration, estimated payload size, and table disk space.
         """
         try:
+            table_kb = self._get_entity_table_size_kb(entity)
             with self.env.cr.savepoint():
                 self.env['frappe.sync.log'].create({
                     'tenant_id': tenant.id,
                     'entity': entity,
                     'status': status,
                     'details': details,
-                    'records_synced': records
+                    'records_synced': records,
+                    'duration_seconds': round(duration, 2),
+                    'payload_size_kb': round(payload_kb, 2),
+                    'table_size_kb': table_kb,
                 })
         except Exception:
             pass  # Log failures must never crash the sync
@@ -404,7 +479,12 @@ class FrappeSyncEngine(models.TransientModel):
         return cat
 
     def _pull_products_from_frappe(self, tenant, start_time=None):
-        frappe_items = self._frappe_get(tenant, 'Item', limit=2000)
+        filters = []
+        if tenant.frappe_last_pull_datetime:
+            # Only pull items modified in Frappe since the last successful pull
+            filters.append(['modified', '>=', str(tenant.frappe_last_pull_datetime)])
+
+        frappe_items = self._frappe_get(tenant, 'Item', limit=2000, filters=filters if filters else None)
         if not frappe_items:
             return {'synced': 0, 'skipped': 0}
 
@@ -601,8 +681,12 @@ class FrappeSyncEngine(models.TransientModel):
         process_items(variants_to_process, is_variant_mode=True)
 
         total = created + updated
+        pull_duration = time.time() - (start_time if start_time else time.time())
+        est_payload_kb = len(json.dumps(frappe_items).encode('utf-8')) / 1024.0 if frappe_items else 0.0
         if total > 0 or errors > 0:
-            self._log(tenant, 'Item (pull)', 'success' if total > 0 else 'error', f'Frappe → Odoo: {created} created, {updated} updated, {skipped} existing, {errors} errors', total)
+            self._log(tenant, 'Product (pull)', 'success' if total > 0 else 'error', 
+                      f'Frappe → Odoo: {created} created, {updated} updated, {skipped} existing, {errors} errors', 
+                      total, duration=pull_duration, payload_kb=est_payload_kb)
         return {'synced': total, 'skipped': skipped}
 
     def _sync_products(self, tenant, start_time=None):
@@ -616,15 +700,20 @@ class FrappeSyncEngine(models.TransientModel):
         item_group   = self._get_frappe_item_group(tenant)
         fallback_uom = self._get_frappe_uom(tenant)
 
-        products = self.env['havanoposdesk.product'].search([
+        prod_domain = [
             ('tenant_id', '=', tenant.id),
             ('is_active', '=', True),
             ('not_for_sale', '=', False)
-        ])
-        
-        variants = self.env['havanoposdesk.product.variant'].search([
+        ]
+        var_domain = [
             ('tenant_id', '=', tenant.id)
-        ])
+        ]
+        if tenant.frappe_last_push_datetime:
+            prod_domain.append(('write_date', '>=', tenant.frappe_last_push_datetime))
+            var_domain.append(('write_date', '>=', tenant.frappe_last_push_datetime))
+
+        products = self.env['havanoposdesk.product'].search(prod_domain)
+        variants = self.env['havanoposdesk.product.variant'].search(var_domain)
 
         created = 0
         updated = 0
@@ -735,8 +824,11 @@ class FrappeSyncEngine(models.TransientModel):
             )
 
         total = created + updated
+        push_duration = time.time() - (start_time if start_time else time.time())
         if total > 0 or errors > 0:
-            self._log(tenant, 'Item (push)', 'success' if total > 0 else 'error', f'Odoo → Frappe: {created} created, {updated} updated, {skipped} existing, {errors} errors', total)
+            self._log(tenant, 'Product (push)', 'success' if total > 0 else 'error', 
+                      f'Odoo → Frappe: {created} created, {updated} updated, {skipped} existing, {errors} errors', 
+                      total, duration=push_duration)
         return {'synced': total, 'skipped': skipped}
 
     def _sync_customers(self, tenant, start_time=None):
@@ -747,9 +839,11 @@ class FrappeSyncEngine(models.TransientModel):
         cust_group = self._get_frappe_customer_group(tenant)
         territory = self._get_frappe_territory(tenant)
 
-        customers = self.env['havanoposdesk.customer'].search([
-            ('tenant_id', '=', tenant.id)
-        ])
+        cust_domain = [('tenant_id', '=', tenant.id)]
+        if tenant.frappe_last_push_datetime:
+            cust_domain.append(('write_date', '>=', tenant.frappe_last_push_datetime))
+
+        customers = self.env['havanoposdesk.customer'].search(cust_domain)
 
         count = 0
         skipped = 0
@@ -780,8 +874,9 @@ class FrappeSyncEngine(models.TransientModel):
             if res and res.get('name'):
                 count += 1
 
+        cust_dur = time.time() - (start_time if start_time else time.time())
         if count > 0:
-            self._log(tenant, 'Customer', 'success', f'Pushed {count} customers to Frappe', count)
+            self._log(tenant, 'Customer', 'success', f'Pushed {count} customers to Frappe', count, duration=cust_dur)
         return {'synced': count, 'skipped': skipped}
 
     def _pull_stores_from_frappe(self, tenant, start_time=None):
@@ -835,9 +930,11 @@ class FrappeSyncEngine(models.TransientModel):
                 self._log(tenant, 'Store (pull)', 'error', f'Failed to create "{wh_name}": {str(e)}')
 
         total = created + updated
+        st_dur = time.time() - (start_time if start_time else time.time())
         if total > 0 or errors > 0:
             self._log(tenant, 'Store (pull)', 'success' if total > 0 else 'error', 
-                      f'Frappe → Odoo: {created} created, {updated} updated, {skipped} existing, {errors} errors', total)
+                      f'Frappe → Odoo: {created} created, {updated} updated, {skipped} existing, {errors} errors', 
+                      total, duration=st_dur)
         return {'synced': total, 'skipped': skipped}
 
     def _pull_stock_from_frappe(self, tenant, start_time=None):
@@ -922,8 +1019,12 @@ class FrappeSyncEngine(models.TransientModel):
                 errors += 1
                 self._log(tenant, 'Stock (pull)', 'error', f'Failed to update stock for {item_code}: {str(e)}')
 
+        stock_dur = time.time() - (start_time if start_time else time.time())
+        est_bin_kb = len(json.dumps(bins).encode('utf-8')) / 1024.0 if bins else 0.0
         if updated > 0 or errors > 0:
-            self._log(tenant, 'Stock (pull)', 'success' if updated > 0 else 'error', f'Frappe → Odoo: {updated} updated, {skipped} existing, {errors} errors', updated)
+            self._log(tenant, 'Stock (pull)', 'success' if updated > 0 else 'error', 
+                      f'Frappe → Odoo: {updated} updated, {skipped} existing, {errors} errors', 
+                      updated, duration=stock_dur, payload_kb=est_bin_kb)
         return {'synced': updated, 'skipped': skipped}
 
     def _sync_stores(self, tenant, start_time=None):
@@ -931,9 +1032,11 @@ class FrappeSyncEngine(models.TransientModel):
         frappe_warehouses = self._frappe_get(tenant, 'Warehouse', limit=200)
         frappe_wh_names = {w.get('warehouse_name', w.get('name', '')): True for w in frappe_warehouses}
 
-        stores = self.env['havanoposdesk.store'].search([
-            ('tenant_id', '=', tenant.id)
-        ])
+        store_domain = [('tenant_id', '=', tenant.id)]
+        if tenant.frappe_last_push_datetime:
+            store_domain.append(('write_date', '>=', tenant.frappe_last_push_datetime))
+
+        stores = self.env['havanoposdesk.store'].search(store_domain)
 
         count = 0
         skipped = 0
@@ -1365,8 +1468,9 @@ class FrappeSyncEngine(models.TransientModel):
             else:
                 self._log(tenant, f'Sale: {sale.name}', 'error', 'Failed to push to Frappe')
 
+        sales_dur = time.time() - (start_time if start_time else time.time())
         if count > 0:
-            self._log(tenant, 'Sales Invoice', 'success', f'Pushed {count} sales to Frappe', count)
+            self._log(tenant, 'Sales Invoice', 'success', f'Pushed {count} sales to Frappe', count, duration=sales_dur)
         return {'synced': count, 'skipped': skipped}
 
     def _pull_users_from_frappe(self, tenant, start_time=None):
@@ -1448,9 +1552,11 @@ class FrappeSyncEngine(models.TransientModel):
                 self._log(tenant, 'User (pull)', 'error', f'Failed to create "{email}": {str(e)}')
 
         total = created + updated
+        u_pull_dur = time.time() - (start_time if start_time else time.time())
         if total > 0 or errors > 0:
             self._log(tenant, 'User (pull)', 'success' if total > 0 else 'error', 
-                      f'Frappe → Odoo: {created} created, {updated} updated, {skipped} existing, {errors} errors', total)
+                      f'Frappe → Odoo: {created} created, {updated} updated, {skipped} existing, {errors} errors', 
+                      total, duration=u_pull_dur)
         return {'synced': total, 'skipped': skipped}
 
     def _sync_users(self, tenant, start_time=None):
@@ -1462,7 +1568,11 @@ class FrappeSyncEngine(models.TransientModel):
             if email:
                 frappe_user_map[email.lower()] = u
 
-        odoo_users = self.env['res.users'].sudo().search([('tenant_id', '=', tenant.id)])
+        user_domain = [('tenant_id', '=', tenant.id)]
+        if tenant.frappe_last_push_datetime:
+            user_domain.append(('write_date', '>=', tenant.frappe_last_push_datetime))
+
+        odoo_users = self.env['res.users'].sudo().search(user_domain)
 
         created = 0
         updated = 0
@@ -1515,7 +1625,9 @@ class FrappeSyncEngine(models.TransientModel):
                     self._log(tenant, 'User', 'error', f'Failed to push user "{email}"')
 
         total = created + updated
+        u_push_dur = time.time() - (start_time if start_time else time.time())
         if total > 0 or errors > 0:
             self._log(tenant, 'User (push)', 'success' if total > 0 else 'error', 
-                      f'Odoo → Frappe: {created} created, {updated} updated, {skipped} existing, {errors} errors', total)
+                      f'Odoo → Frappe: {created} created, {updated} updated, {skipped} existing, {errors} errors', 
+                      total, duration=u_push_dur)
         return {'synced': total, 'skipped': skipped}
