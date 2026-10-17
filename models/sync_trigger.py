@@ -1,9 +1,17 @@
+import time
 import threading
 from odoo import models, fields, api
 
+_SYNC_LOCK = threading.Lock()
+_LAST_TRIGGER_TIME = 0.0
+_DEBOUNCE_INTERVAL = 15.0  # seconds between automatic background sync sweeps
+
 def _run_sync_async(env, tenant_id=None):
-    """Run sync in a separate thread and new DB cursor to avoid blocking HTTP workers."""
+    """Run sync in a single background worker to avoid spawn floods and thread explosions."""
     def worker():
+        # If another sync worker is already running, exit immediately without queuing up
+        if not _SYNC_LOCK.acquire(blocking=False):
+            return
         try:
             with env.registry.cursor() as new_cr:
                 new_env = api.Environment(new_cr, env.uid, env.context)
@@ -16,23 +24,32 @@ def _run_sync_async(env, tenant_id=None):
                     engine.cron_sync_all()
         except Exception:
             pass
+        finally:
+            _SYNC_LOCK.release()
 
-    t = threading.Thread(target=worker, daemon=True)
+    t = threading.Thread(target=worker, daemon=True, name="FrappeSyncAsyncWorker")
     t.start()
 
-def trigger_sync(env, tenant=None, immediate=True):
-    """Trigger sync safely in background without blocking HTTP workers or causing 502 timeouts."""
+def trigger_sync(env, tenant=None, immediate=False):
+    """Trigger sync safely without blocking HTTP workers, debounced to avoid 502s."""
+    global _LAST_TRIGGER_TIME
+    now = time.time()
+    
+    # Debounce: if triggered within the debounce interval, ignore to prevent worker starvation
+    if not immediate and (now - _LAST_TRIGGER_TIME < _DEBOUNCE_INTERVAL):
+        return
+
+    _LAST_TRIGGER_TIME = now
     try:
         cron = env.ref('frappe_odoo_sync.ir_cron_frappe_sync', raise_if_not_found=False)
-        # If cron is active, trigger cron to pick it up in background
+        # If cron is active, trigger cron to pick it up via standard Odoo cron worker
         if cron and cron.active:
             cron._trigger()
             return
 
-        # If cron is inactive, run in non-blocking background thread
-        if immediate:
-            tenant_id = tenant.id if tenant else None
-            _run_sync_async(env, tenant_id)
+        # If cron is inactive, run in single throttled background thread
+        tenant_id = tenant.id if tenant else None
+        _run_sync_async(env, tenant_id)
     except Exception:
         pass
 
