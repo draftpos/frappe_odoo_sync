@@ -31,15 +31,41 @@ class TenantFrappeSettings(models.Model):
 
     def _compute_sync_stats(self):
         for rec in self:
-            logs = rec.frappe_sync_log_ids
-            rec.sync_stat_sales_count = sum(l.records_synced for l in logs if 'sale' in (l.entity or '').lower() and l.status == 'success')
-            rec.sync_stat_products_count = sum(l.records_synced for l in logs if ('product' in (l.entity or '').lower() or 'item' in (l.entity or '').lower()) and l.status == 'success')
-            rec.sync_stat_stock_count = sum(l.records_synced for l in logs if 'stock' in (l.entity or '').lower() and l.status == 'success')
-            rec.sync_stat_customers_count = sum(l.records_synced for l in logs if 'customer' in (l.entity or '').lower() and l.status == 'success')
-            rec.sync_stat_users_count = sum(l.records_synced for l in logs if 'user' in (l.entity or '').lower() and l.status == 'success')
+            if not rec.id:
+                rec.sync_stat_sales_count = 0
+                rec.sync_stat_products_count = 0
+                rec.sync_stat_stock_count = 0
+                rec.sync_stat_customers_count = 0
+                rec.sync_stat_users_count = 0
+                rec.sync_stat_total_space_mb = 0.0
+                continue
+
+            try:
+                # Fast SQL aggregation — never loads log recordsets into Python heap
+                self.env.cr.execute("""
+                    SELECT 
+                        COALESCE(SUM(CASE WHEN entity ILIKE '%sale%' AND status = 'success' THEN records_synced ELSE 0 END), 0),
+                        COALESCE(SUM(CASE WHEN (entity ILIKE '%product%' OR entity ILIKE '%item%') AND status = 'success' THEN records_synced ELSE 0 END), 0),
+                        COALESCE(SUM(CASE WHEN entity ILIKE '%stock%' AND status = 'success' THEN records_synced ELSE 0 END), 0),
+                        COALESCE(SUM(CASE WHEN entity ILIKE '%customer%' AND status = 'success' THEN records_synced ELSE 0 END), 0),
+                        COALESCE(SUM(CASE WHEN entity ILIKE '%user%' AND status = 'success' THEN records_synced ELSE 0 END), 0)
+                    FROM frappe_sync_log
+                    WHERE tenant_id = %s;
+                """, (rec.id,))
+                res = self.env.cr.fetchone()
+                rec.sync_stat_sales_count = int(res[0]) if res else 0
+                rec.sync_stat_products_count = int(res[1]) if res else 0
+                rec.sync_stat_stock_count = int(res[2]) if res else 0
+                rec.sync_stat_customers_count = int(res[3]) if res else 0
+                rec.sync_stat_users_count = int(res[4]) if res else 0
+            except Exception:
+                rec.sync_stat_sales_count = 0
+                rec.sync_stat_products_count = 0
+                rec.sync_stat_stock_count = 0
+                rec.sync_stat_customers_count = 0
+                rec.sync_stat_users_count = 0
 
             # Calculate total DB footprint across the main sync tables
-            total_kb = 0.0
             try:
                 tables = ('havanoposdesk_sale', 'havanoposdesk_product', 'havanoposdesk_stock_valuation', 'havanoposdesk_customer', 'res_users')
                 self.env.cr.execute("""
@@ -56,7 +82,6 @@ class TenantFrappeSettings(models.Model):
     def _compute_store_count(self):
         for rec in self:
             rec.store_count = self.env['havanoposdesk.store'].search_count([('tenant_id', '=', rec.id)])
-
 
     def action_test_frappe_connection(self):
         self.ensure_one()

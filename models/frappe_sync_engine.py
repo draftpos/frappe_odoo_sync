@@ -49,6 +49,7 @@ class FrappeSyncEngine(models.TransientModel):
 
     @api.model
     def sync_tenant(self, tenant):
+        self = self.with_context(skip_frappe_sync=True)
         start_time = time.time()
         try:
             # 1. Sync UOMs first so Frappe has them before products/sales reference them
@@ -204,8 +205,9 @@ class FrappeSyncEngine(models.TransientModel):
             self._log(tenant, 'Revert', 'error', str(e))
             raise exceptions.UserError(f'Revert failed: {str(e)}')
 
-    def _frappe_get(self, tenant, doctype, limit=500, filters=None):
-        url = f"{tenant.frappe_url.rstrip('/')}/api/resource/{urllib.parse.quote(doctype)}?limit_page_length={limit}&fields=[\"*\"]"
+    def _frappe_get(self, tenant, doctype, limit=500, filters=None, fields=None):
+        fields_json = json.dumps(fields) if fields else '["*"]'
+        url = f"{tenant.frappe_url.rstrip('/')}/api/resource/{urllib.parse.quote(doctype)}?limit_page_length={limit}&fields={urllib.parse.quote(fields_json)}"
         if filters:
             url += f"&filters={urllib.parse.quote(json.dumps(filters))}"
         req = urllib.request.Request(url, headers={
@@ -317,7 +319,10 @@ class FrappeSyncEngine(models.TransientModel):
             return {'error': str(e)}
 
     def _get_entity_table_size_kb(self, entity):
-        """Query PostgreSQL for total relation size in KB for the entity's underlying table."""
+        """Query PostgreSQL for total relation size in KB with per-session caching to save RAM and DB buffers."""
+        if not hasattr(self, '_table_kb_cache'):
+            self._table_kb_cache = {}
+
         table_map = {
             'Item': 'havanoposdesk_product',
             'Product': 'havanoposdesk_product',
@@ -339,13 +344,18 @@ class FrappeSyncEngine(models.TransientModel):
         if not target_table:
             return 0.0
 
+        if target_table in self._table_kb_cache:
+            return self._table_kb_cache[target_table]
+
         try:
             self.env.cr.execute(
                 "SELECT pg_total_relation_size(%s::regclass)::float / 1024.0;",
                 (target_table,)
             )
             res = self.env.cr.fetchone()
-            return round(res[0], 2) if res and res[0] else 0.0
+            val = round(res[0], 2) if res and res[0] else 0.0
+            self._table_kb_cache[target_table] = val
+            return val
         except Exception:
             return 0.0
 
@@ -484,7 +494,12 @@ class FrappeSyncEngine(models.TransientModel):
             # Only pull items modified in Frappe since the last successful pull
             filters.append(['modified', '>=', str(tenant.frappe_last_pull_datetime)])
 
-        frappe_items = self._frappe_get(tenant, 'Item', limit=2000, filters=filters if filters else None)
+        item_fields = [
+            'item_code', 'name', 'item_name', 'standard_rate', 'valuation_rate',
+            'is_stock_item', 'disabled', 'description', 'barcode', 'item_group',
+            'discount_percentage', 'has_variants', 'variant_of', 'is_sales_item', 'stock_uom'
+        ]
+        frappe_items = self._frappe_get(tenant, 'Item', limit=2000, filters=filters if filters else None, fields=item_fields)
         if not frappe_items:
             return {'synced': 0, 'skipped': 0}
 
@@ -529,6 +544,7 @@ class FrappeSyncEngine(models.TransientModel):
                 if i > 0 and i % 50 == 0:
                     try:
                         self.env.cr.commit()
+                        self.env.invalidate_all()
                     except Exception:
                         pass
 
@@ -690,7 +706,12 @@ class FrappeSyncEngine(models.TransientModel):
         return {'synced': total, 'skipped': skipped}
 
     def _sync_products(self, tenant, start_time=None):
-        frappe_items_list = self._frappe_get(tenant, 'Item', limit=2000)
+        prod_fields = [
+            'item_code', 'name', 'item_name', 'standard_rate', 'valuation_rate',
+            'stock_uom', 'is_stock_item', 'has_variants', 'disabled', 'variant_of',
+            'barcode', 'description'
+        ]
+        frappe_items_list = self._frappe_get(tenant, 'Item', limit=2000, fields=prod_fields)
         frappe_item_map = {}
         for i in frappe_items_list:
             code = i.get('item_code') or i.get('name', '')
@@ -833,7 +854,7 @@ class FrappeSyncEngine(models.TransientModel):
 
     def _sync_customers(self, tenant, start_time=None):
         """Push Odoo customers TO Frappe."""
-        frappe_custs = self._frappe_get(tenant, 'Customer', limit=1000)
+        frappe_custs = self._frappe_get(tenant, 'Customer', limit=1000, fields=['name', 'customer_name'])
         frappe_cust_names = {c.get('customer_name', c.get('name', '')): True for c in frappe_custs}
 
         cust_group = self._get_frappe_customer_group(tenant)
@@ -881,7 +902,7 @@ class FrappeSyncEngine(models.TransientModel):
 
     def _pull_stores_from_frappe(self, tenant, start_time=None):
         """Pull Frappe Warehouses -> Odoo Stores (havanoposdesk.store)"""
-        frappe_warehouses = self._frappe_get(tenant, 'Warehouse', limit=500)
+        frappe_warehouses = self._frappe_get(tenant, 'Warehouse', limit=500, fields=['name', 'warehouse_name', 'disabled'])
         if not frappe_warehouses:
             return {'synced': 0, 'skipped': 0}
 
@@ -939,7 +960,7 @@ class FrappeSyncEngine(models.TransientModel):
 
     def _pull_stock_from_frappe(self, tenant, start_time=None):
         """Pull Frappe Bin quantities -> Odoo havanoposdesk.stock.valuation"""
-        bins = self._frappe_get(tenant, 'Bin', limit=5000)
+        bins = self._frappe_get(tenant, 'Bin', limit=5000, fields=['item_code', 'warehouse', 'actual_qty'])
         if not bins:
             return {'synced': 0, 'skipped': 0}
 
@@ -956,10 +977,17 @@ class FrappeSyncEngine(models.TransientModel):
         skipped = 0
         errors = 0
 
-        for b in bins:
+        for i, b in enumerate(bins):
             if start_time and time.time() - start_time > 50:
                 self._log(tenant, 'Stock (pull)', 'skipped', 'Time limit reached. Yielding to prevent server restart.')
                 break
+
+            if i > 0 and i % 50 == 0:
+                try:
+                    self.env.cr.commit()
+                    self.env.invalidate_all()
+                except Exception:
+                    pass
 
             item_code = b.get('item_code')
             warehouse = b.get('warehouse')
@@ -1029,7 +1057,7 @@ class FrappeSyncEngine(models.TransientModel):
 
     def _sync_stores(self, tenant, start_time=None):
         """Push Odoo stores TO Frappe as Warehouses."""
-        frappe_warehouses = self._frappe_get(tenant, 'Warehouse', limit=200)
+        frappe_warehouses = self._frappe_get(tenant, 'Warehouse', limit=200, fields=['name', 'warehouse_name'])
         frappe_wh_names = {w.get('warehouse_name', w.get('name', '')): True for w in frappe_warehouses}
 
         store_domain = [('tenant_id', '=', tenant.id)]
@@ -1131,8 +1159,7 @@ class FrappeSyncEngine(models.TransientModel):
 
     def _ensure_frappe_item_exists(self, tenant, item_code, item_name, item_group, stock_uom):
         """Ensure an item exists in Frappe, create if not."""
-        items = self._frappe_get(tenant, 'Item', limit=1)
-        # Try to get specific item
+        # Try to get specific item directly
         url = f"{tenant.frappe_url.rstrip('/')}/api/resource/Item/{urllib.parse.quote(item_code)}"
         req = urllib.request.Request(url, headers={
             'Authorization': f'token {tenant.frappe_api_key}:{tenant.frappe_api_secret}',
@@ -1230,12 +1257,12 @@ class FrappeSyncEngine(models.TransientModel):
 
     def _sync_sales(self, tenant, start_time=None):
         """Push Odoo sales to Frappe as Sales Invoices."""
-        frappe_invoices = self._frappe_get(tenant, 'Sales Invoice', limit=2000)
+        frappe_invoices = self._frappe_get(tenant, 'Sales Invoice', limit=2000, fields=['name', 'po_no'])
         synced_sales = {inv.get('po_no'): True for inv in frappe_invoices if inv.get('po_no')}
 
         # Fetch Frappe warehouses to map to Odoo stores
         company = self._get_frappe_company(tenant)
-        frappe_whs = self._frappe_get(tenant, 'Warehouse', limit=500)
+        frappe_whs = self._frappe_get(tenant, 'Warehouse', limit=500, fields=['name', 'warehouse_name', 'company'])
         # Build a mapping that covers BOTH the display name (warehouse_name)
         # AND the full internal ID (e.g. "Main Store - GVS") so that an Odoo
         # store named either way will resolve to the correct Frappe warehouse.
@@ -1251,7 +1278,7 @@ class FrappeSyncEngine(models.TransientModel):
                 wh_name_to_id[internal_id.lower()] = internal_id
 
         # Fetch Frappe customers to map Odoo customer names to Frappe IDs
-        frappe_custs = self._frappe_get(tenant, 'Customer', limit=2000)
+        frappe_custs = self._frappe_get(tenant, 'Customer', limit=2000, fields=['name', 'customer_name'])
         cust_name_to_id = {}
         for c in frappe_custs:
             internal_id = c.get('name', '')
@@ -1281,6 +1308,7 @@ class FrappeSyncEngine(models.TransientModel):
             if i > 0 and i % 20 == 0:
                 try:
                     self.env.cr.commit()
+                    self.env.invalidate_all()
                 except Exception:
                     pass
             if sale.name in synced_sales:
@@ -1475,7 +1503,8 @@ class FrappeSyncEngine(models.TransientModel):
 
     def _pull_users_from_frappe(self, tenant, start_time=None):
         """Pull Frappe Users -> Odoo res.users (tenant specific)"""
-        frappe_users = self._frappe_get(tenant, 'User', limit=1000)
+        user_fields = ['name', 'email', 'first_name', 'last_name', 'full_name', 'enabled']
+        frappe_users = self._frappe_get(tenant, 'User', limit=1000, fields=user_fields)
         if not frappe_users:
             return {'synced': 0, 'skipped': 0}
 
@@ -1498,6 +1527,7 @@ class FrappeSyncEngine(models.TransientModel):
             if i > 0 and i % 50 == 0:
                 try:
                     self.env.cr.commit()
+                    self.env.invalidate_all()
                 except Exception:
                     pass
             email = (f_user.get('email') or f_user.get('name') or '').strip()
@@ -1561,7 +1591,7 @@ class FrappeSyncEngine(models.TransientModel):
 
     def _sync_users(self, tenant, start_time=None):
         """Push Odoo res.users -> Frappe User"""
-        frappe_users_list = self._frappe_get(tenant, 'User', limit=1000)
+        frappe_users_list = self._frappe_get(tenant, 'User', limit=1000, fields=['name', 'email', 'first_name', 'last_name', 'enabled'])
         frappe_user_map = {}
         for u in frappe_users_list:
             email = u.get('email') or u.get('name')

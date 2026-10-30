@@ -14,7 +14,9 @@ def _run_sync_async(env, tenant_id=None):
             return
         try:
             with env.registry.cursor() as new_cr:
-                new_env = api.Environment(new_cr, env.uid, env.context)
+                # Add skip_frappe_sync=True so internal writes during sync never trigger cascaded syncs
+                ctx = dict(env.context or {}, skip_frappe_sync=True)
+                new_env = api.Environment(new_cr, env.uid, ctx)
                 engine = new_env['frappe.sync.engine']
                 if tenant_id:
                     tenant = new_env['havanoposdesk.tenant'].browse(tenant_id)
@@ -22,6 +24,8 @@ def _run_sync_async(env, tenant_id=None):
                         engine.sync_tenant(tenant)
                 else:
                     engine.cron_sync_all()
+                # Clear ORM cache in thread before releasing cursor
+                new_env.invalidate_all()
         except Exception:
             pass
         finally:
@@ -32,6 +36,10 @@ def _run_sync_async(env, tenant_id=None):
 
 def trigger_sync(env, tenant=None, immediate=False):
     """Trigger sync safely without blocking HTTP workers, debounced to avoid 502s."""
+    # Never trigger if already executing inside a sync cycle
+    if env.context.get('skip_frappe_sync'):
+        return
+
     global _LAST_TRIGGER_TIME
     now = time.time()
     
@@ -54,20 +62,20 @@ def trigger_sync(env, tenant=None, immediate=False):
         pass
 
 
-
-
 class HavanoposdeskProduct(models.Model):
     _inherit = 'havanoposdesk.product'
 
     @api.model_create_multi
     def create(self, vals_list):
         res = super().create(vals_list)
-        trigger_sync(self.env)
+        if not self.env.context.get('skip_frappe_sync'):
+            trigger_sync(self.env)
         return res
 
     def write(self, vals):
         res = super().write(vals)
-        trigger_sync(self.env)
+        if not self.env.context.get('skip_frappe_sync'):
+            trigger_sync(self.env)
         return res
 
 class HavanoposdeskUom(models.Model):
@@ -76,12 +84,14 @@ class HavanoposdeskUom(models.Model):
     @api.model_create_multi
     def create(self, vals_list):
         res = super().create(vals_list)
-        trigger_sync(self.env)
+        if not self.env.context.get('skip_frappe_sync'):
+            trigger_sync(self.env)
         return res
 
     def write(self, vals):
         res = super().write(vals)
-        trigger_sync(self.env)
+        if not self.env.context.get('skip_frappe_sync'):
+            trigger_sync(self.env)
         return res
 
 class HavanoposdeskCustomer(models.Model):
@@ -90,12 +100,14 @@ class HavanoposdeskCustomer(models.Model):
     @api.model_create_multi
     def create(self, vals_list):
         res = super().create(vals_list)
-        trigger_sync(self.env)
+        if not self.env.context.get('skip_frappe_sync'):
+            trigger_sync(self.env)
         return res
 
     def write(self, vals):
         res = super().write(vals)
-        trigger_sync(self.env)
+        if not self.env.context.get('skip_frappe_sync'):
+            trigger_sync(self.env)
         return res
 
 class HavanoposdeskStore(models.Model):
@@ -104,12 +116,14 @@ class HavanoposdeskStore(models.Model):
     @api.model_create_multi
     def create(self, vals_list):
         res = super().create(vals_list)
-        trigger_sync(self.env)
+        if not self.env.context.get('skip_frappe_sync'):
+            trigger_sync(self.env)
         return res
 
     def write(self, vals):
         res = super().write(vals)
-        trigger_sync(self.env)
+        if not self.env.context.get('skip_frappe_sync'):
+            trigger_sync(self.env)
         return res
 
 class HavanoposdeskSale(models.Model):
@@ -118,12 +132,14 @@ class HavanoposdeskSale(models.Model):
     @api.model_create_multi
     def create(self, vals_list):
         res = super().create(vals_list)
-        trigger_sync(self.env)
+        if not self.env.context.get('skip_frappe_sync'):
+            trigger_sync(self.env)
         return res
 
     def write(self, vals):
         res = super().write(vals)
-        trigger_sync(self.env)
+        if not self.env.context.get('skip_frappe_sync'):
+            trigger_sync(self.env)
         return res
 
 class ResUsers(models.Model):
@@ -132,13 +148,12 @@ class ResUsers(models.Model):
     @api.model_create_multi
     def create(self, vals_list):
         res = super().create(vals_list)
-        trigger_sync(self.env)
+        if not self.env.context.get('skip_frappe_sync'):
+            trigger_sync(self.env)
         return res
 
     def write(self, vals):
         res = super().write(vals)
-        trigger_sync(self.env)
+        if not self.env.context.get('skip_frappe_sync'):
+            trigger_sync(self.env)
         return res
-
-
-
